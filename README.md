@@ -10,7 +10,7 @@ High-performance fork of [`spisakt/pTFCE`](https://github.com/spisakt/pTFCE) imp
 remotes::install_github("HallquistLab/pTFCE")
 ```
 
-## Key Enhancements in This Fork (`v0.3.0`)
+## Key Enhancements in This Fork (`v0.4.0`)
 
 - **Fast `Rcpp` Engine (~400–900x Faster, Minimal Memory):**
   - Replaces repeated 3D connected-component labeling (`mmand::components` + `table`) and 4D intermediate voxel-by-threshold arrays with a **single-pass descending Union-Find (Disjoint-Set)** sweep in C++ (~0.33 s for a whole-brain bi-sided contrast vs. ~2.5–5 min previously).
@@ -18,6 +18,8 @@ remotes::install_github("HallquistLab/pTFCE")
   - Drops `mmand` dependency; supports `RNifti` (`niftiImage`), `oro.nifti` (`nifti`, optional), plain R `array`s, and NIfTI file paths directly.
 - **Native Bi-Sided (`sided = "two.sided"`) Enhancement:**
   - Enhances positive (`Z > 0`) and negative (`Z < 0`) excursion sets symmetrically using an identical threshold resolution, returning signed enhanced Z-scores (`$Z`), two-sided uncorrected p-values (`$p`), `-log(p)` (`$logp`), and two-sided GRF FWER thresholds (`$fwer0.05.Z`, `$fwe.Z`).
+- **Optional Non-Stationary Smoothness Adjustment (`nonstationary = TRUE`):**
+  - Implements Worsley et al. (1999) / Hayasaka et al. (2004) / Salimi-Khorshidi et al. (2011) non-stationary cluster extent adjustment using spatially regularized voxelwise roughness weights `w(v) = dLh(v) / mean(dLh)` from 4D residuals (`res4d`) or precomputed `local_smoothness` / `RPV` maps—tempering smooth-region false positives while boosting sensitivity in rougher subcortical regions. Defaults to `nonstationary = FALSE` for backward compatibility.
 - **Grid-Invariant Integration (`dh = 0.05` + Analytical Sub-`ZestThr`):**
   - Evaluates the unenhanced interval `[0, -log(Phi(-ZestThr))]` analytically and integrates above `ZestThr` with a fixed step `dh = 0.05`.
   - Eliminates cross-cluster interference from distant extreme Z-peaks (`Z_max` no longer coarsens step size `dh`) and removes the ~20% zero dead-zone around `Z = 0` as well as the `-8.21` out-of-mask floor. Legacy `Nh`-grid behavior remains available via `Nh = 100` or `legacy = TRUE`.
@@ -33,13 +35,14 @@ remotes::install_github("HallquistLab/pTFCE")
 ```r
 library(pTFCE)
 
-# Bi-sided pTFCE enhancement using 4D GLM residuals for smoothness estimation
+# Bi-sided pTFCE enhancement using 4D GLM residuals (optionally with nonstationary = TRUE)
 res <- ptfce(
   img = "zstat1.nii.gz",
   mask = "mask.nii.gz",
   residual = "res4d.nii.gz",
   dof = 42,
   sided = "two.sided",
+  nonstationary = FALSE, # set TRUE to adjust cluster sizes for spatial non-stationarity
   fwe_p = c(0.05, 0.01)
 )
 

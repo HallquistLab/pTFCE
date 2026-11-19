@@ -13,11 +13,11 @@ dvox_clust_cpp <- function(h, V, Rd, c, ZestThr = 1.3) {
     .Call(`_pTFCE_dvox_clust_cpp`, h, V, Rd, c, ZestThr)
 }
 
-ptfce_tail_cpp <- function(img, mask, nx, ny, nz, V, Rd, threshs, weights, dh_legacy, ZestThr, connectivity, analytical_subthr) {
-    .Call(`_pTFCE_ptfce_tail_cpp`, img, mask, nx, ny, nz, V, Rd, threshs, weights, dh_legacy, ZestThr, connectivity, analytical_subthr)
+ptfce_tail_cpp <- function(img, mask, nx, ny, nz, V, Rd, threshs, weights, dh_legacy, ZestThr, connectivity, analytical_subthr, voxel_weights = NULL) {
+    .Call(`_pTFCE_ptfce_tail_cpp`, img, mask, nx, ny, nz, V, Rd, threshs, weights, dh_legacy, ZestThr, connectivity, analytical_subthr, voxel_weights)
 }
 
-smoothest_cpp <- function(img, mask, nx, ny, nz, nt) {
-    .Call(`_pTFCE_smoothest_cpp`, img, mask, nx, ny, nz, nt)
+smoothest_cpp <- function(img, mask, nx, ny, nz, nt, compute_local = FALSE, smooth_fwhm = 3.0, dof_correction = 1.0) {
+    .Call(`_pTFCE_smoothest_cpp`, img, mask, nx, ny, nz, nt, compute_local, smooth_fwhm, dof_correction)
 }
 

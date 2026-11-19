@@ -34,15 +34,16 @@ This document records **all statistical, numerical, algorithmic, and API departu
 
 ## Summary Table of Departures from Upstream (`v0.2.2.1`)
 
-| Component | Upstream `spisakt/pTFCE` (`v0.2.2.1`) | `HallquistLab/pTFCE` (`v0.3.0`) | Backward Compatibility |
+| Component | Upstream `spisakt/pTFCE` (`v0.2.2.1`) | `HallquistLab/pTFCE` (`v0.4.0`) | Backward Compatibility |
 | :--- | :--- | :--- | :--- |
 | **Sidedness** | Positive tail only (`Z > 0`); negative tail requires manual two-pass wrapper | Native `sided = c("positive", "two.sided", "negative")`; `"positive"` default | 100% drop-in compatible; `sided = "two.sided"` opt-in |
+| **Non-stationarity** | Stationary smoothness only (uniform raw voxel counts across brain) | Optional `nonstationary = TRUE` & `local_smoothness` resel-scaled cluster sizes (`w(v) = dLh(v)/mean(dLh)`) | Opt-in (`nonstationary = FALSE` default) |
 | **Threshold grid & sub-`ZestThr` integration** | `Nh = 100` equidistant points on `[0, logpmax]`; step `dh` scales with $Z_{\max}^2$ | Analytical integration on $[0, x_{\text{ZestThr}}]$ + fixed `dh = 0.05` midpoint grid above `ZestThr` | Pass `Nh = 100` (or `legacy = TRUE`) to use legacy discrete grid |
 | **Sub-threshold & out-of-mask values** | Out-of-mask and $Z \le 0$ map to $Z = -8.2095$; ~20% dead zone near $Z = 0$ in 2-sided clamping | Exact identity $\tilde{Z}_v = Z_v$ for $|Z_v| \le Z_{\text{estThr}}$; out-of-mask `Z = 0`, `logp = 0`, `p = 1` | Legacy floor retained inside mask only when `legacy = TRUE` / `Nh` set |
 | **Posterior quadrature `pvox.clust()`** | Nested `stats::integrate` over `(-Inf, Inf)` with `CONST = 10^40` and `745` cap | Mode-shifted log-space adaptive 15-pt Gauss-Kronrod + Laplace continued fraction + `log1p` near `ZestThr` | Matches upstream to $< 10^{-5}$ where upstream did not underflow |
 | **Connected components & RAM** | 100 passes of `mmand::components` + `table()`; allocates two 4D arrays (~1.5–4 GB) | Single-pass C++ descending Union-Find (`Rcpp`) on in-mask voxels $> Z_{\text{estThr}}$ (~20 MB RAM); drops `mmand` | Identical 6-connectivity default; adds `connectivity = c(6, 18, 26)` |
 | **Pre-masking & `NA`/`Inf` checks** | Applied mask *after* `components()` and `max(img)`; warned on out-of-mask SPM `NaN`s | Masks `img` *before* `max()` and connected components; warns only on in-mask `NA`/`Inf` | Strictly safer for ROI / small-volume masks |
-| **Smoothness (`smoothest()`)** | Pure R triple loop; `if (!is.na(residual))` crashes on R $\ge$ 4.2; `dim[4]==1` crashes `aperm`; `interpolate()` `0/0` bug | Zero-copy 3-pass C++ `smoothest_cpp`; R $\ge$ 4.2 safe; `dim[4]==1` handled; fixed `stats::approx` DOF LUT | Identical FSL `smoothest` formulas at corrected DOF knots |
+| **Smoothness (`smoothest()`)** | Pure R triple loop; `if (!is.na(residual))` crashes on R $\ge$ 4.2; `dim[4]==1` crashes `aperm`; `interpolate()` `0/0` bug | Zero-copy 3-pass C++ `smoothest_cpp` (+ optional local `dLh_map`/`rpv_map`); R $\ge$ 4.2 safe; fixed `stats::approx` DOF LUT | Identical FSL `smoothest` formulas at corrected DOF knots |
 | **FWER helpers (`fwe.p2z`, `fwe.z2p`)** | Non-vectorized; bisection stops at `0.001`; `exp(-0.5*z^2)` underflows at $z > 38.5$ | Vectorized; log-space Newton-Raphson accurate to $10^{-13}$ up to $z > 38$ | ~`2e-4` refinement over coarse `0.001` bisection |
 | **Image I/O & `t2z()`** | Requires `oro.nifti` S4 objects; fails on plain arrays | Supports `RNifti`, `oro.nifti` (in `Suggests`), plain `array`s, and NIfTI paths; adds log-space `t2z(img, dof)` | Returns same image class as input (`oro.nifti` -> `oro.nifti`) |
 
@@ -239,6 +240,84 @@ knitr::kable(cases, digits = 5,
 
 ---
 
+## Non-Stationary Smoothness Adjustment (`v0.4.0`, Opt-In)
+
+### Theory & Regularized Voxelwise Roughness Estimation
+
+Standard `pTFCE` assumes spatially stationary smoothness across the entire mask, measuring every cluster by its raw voxel count $c = |\mathcal{C}|$. In real group fMRI, smoothness varies substantially across anatomy (e.g., medial prefrontal and posterior cingulate cortex are often 2–3$\times$ smoother than subcortical nuclei, brainstem, or cerebellum; Hayasaka et al., 2004; Eklund et al., 2016).
+
+Following Worsley et al. (1999) and Salimi-Khorshidi et al. (2011), setting `nonstationary = TRUE` (while leaving `nonstationary = FALSE` as the default) replaces raw voxel count $c$ with **local resel-scaled cluster size**:
+$$\tilde{c}(\mathcal{C}) = \sum_{v \in \mathcal{C}} w(v), \qquad w(v) = \frac{\widehat{\text{dLh}}(v)}{\overline{\text{dLh}}}, \qquad \frac{1}{V}\sum_{v \in M} w(v) = 1$$
+
+To prevent single-voxel derivative variance noise at finite degrees of freedom:
+
+1. `smoothest(..., nonstationary = TRUE, smooth_fwhm = 3.0)` accumulates symmetric forward and backward neighbor cross-products inside the mask during the same C++ pass over 4D `res4d`.
+2. Numerator and denominator sufficient statistics are smoothed separately via normalized within-mask separable 3D Gaussian convolution (`smooth_fwhm = 3.0` voxels) with mild empirical-Bayes shrinkage (`5%` prior weight) toward the global directional correlation and winsorization to $w(v) \in [0.1, 10.0]$.
+3. Inside `ptfce_tail_cpp()`, Disjoint-Set Union accumulates continuous cluster mass $\tilde{c}(\mathcal{C})$ in $O(1)$ per merge and evaluates log-space posteriors via 256-node / 64-node 4-point cubic Lagrange interpolation tables in $\log \tilde{c}$.
+4. Precomputed smoothness lists (`smoothest(..., nonstationary = TRUE)`) or external RPV maps (e.g., SPM's `RPV.nii`) can also be passed via `local_smoothness = ...` to avoid recomputing residual smoothness across multiple contrasts.
+
+```{r nonstationary-demo, fig.width=7.5, fig.height=4.0}
+smooth_white <- function(x, sigma) {
+  rad <- ceiling(3.5 * sigma)
+  k <- exp(-0.5 * ((-rad:rad)^2) / (sigma^2)); k <- k / sqrt(sum(k^2))
+  d <- dim(x); pd <- d + 2L * rad
+  pad <- array(rnorm(prod(pd)), dim = pd)
+  pad[(rad + 1):(rad + d[1]), (rad + 1):(rad + d[2]), (rad + 1):(rad + d[3])] <- x
+  y1 <- array(0, dim = c(d[1], pd[2], pd[3]))
+  for (i in seq_along(k)) y1 <- y1 + k[i] * pad[i:(i + d[1] - 1), , ]
+  y2 <- array(0, dim = c(d[1], d[2], pd[3]))
+  for (i in seq_along(k)) y2 <- y2 + k[i] * y1[, i:(i + d[2] - 1), ]
+  y3 <- array(0, dim = d)
+  for (i in seq_along(k)) y3 <- y3 + k[i] * y2[, , i:(i + d[3] - 1)]
+  y3
+}
+
+set.seed(2026)
+d_ns <- c(32L, 24L, 16L); nt_ns <- 30L; mask_ns <- array(1, dim = d_ns)
+res4d_ns <- array(0, dim = c(d_ns, nt_ns))
+for (t in seq_len(nt_ns)) {
+  wn <- array(rnorm(prod(d_ns)), dim = d_ns)
+  v_r <- smooth_white(wn, 0.75) # Left half (x <= 16): rough (subcortex-like)
+  v_s <- smooth_white(wn, 2.00) # Right half (x >= 17): smooth (midline cortex-like)
+  v_r[17:32, , ] <- v_s[17:32, , ]
+  res4d_ns[, , , t] <- v_r
+}
+
+# Place two identical 3x3x3 clusters (Z = 3.4, center 3.7) in rough (x=8) vs smooth (x=24) halves
+z_ns <- array(0, dim = d_ns)
+z_ns[7:9, 11:13, 7:9]   <- 3.4; z_ns[8, 12, 8]  <- 3.7
+z_ns[23:25, 11:13, 7:9] <- 3.4; z_ns[24, 12, 8] <- 3.7
+
+out_st <- ptfce(z_ns, mask_ns, residual = res4d_ns, dof = nt_ns - 1,
+                sided = "two.sided", nonstationary = FALSE, verbose = FALSE)
+out_ns <- ptfce(z_ns, mask_ns, residual = res4d_ns, dof = nt_ns - 1,
+                sided = "two.sided", nonstationary = TRUE, verbose = FALSE)
+
+df_prof <- rbind(
+  data.frame(x = 1:32, Z = z_ns[, 12, 8], Curve = "1. Raw Input Z"),
+  data.frame(x = 1:32, Z = out_st$Z[, 12, 8], Curve = "2. Stationary pTFCE (nonstationary = FALSE)"),
+  data.frame(x = 1:32, Z = out_ns$Z[, 12, 8], Curve = "3. Non-Stationary pTFCE (nonstationary = TRUE)")
+)
+
+ggplot(df_prof, aes(x = x, y = Z, color = Curve, linetype = Curve)) +
+  geom_vline(xintercept = 16.5, linetype = "dotted", color = "grey40") +
+  geom_hline(yintercept = out_st$fwer0.05.Z, linetype = "dashed", color = "grey50") +
+  geom_line(linewidth = 0.9) +
+  annotate("text", x = 8.5, y = 5.25, label = "Rough Hemisphere\n(FWHM ~ 1.8 vox)", size = 3.3) +
+  annotate("text", x = 24.5, y = 5.25, label = "Smooth Hemisphere\n(FWHM ~ 4.7 vox)", size = 3.3) +
+  labs(
+    title = "Identical 27-Voxel Clusters in Rough vs. Smooth Regions",
+    subtitle = "Dashed line = two-sided FWER p < 0.05 threshold",
+    x = "X Voxel Coordinate",
+    y = "Z-Score along Line [x, 12, 8]"
+  ) +
+  ylim(-0.2, 5.6) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+---
+
 ## Algorithmic Architecture (`Rcpp`) & Benchmarks
 
 Upstream `pTFCE` executed `Nh = 100` full-volume 3D connected-component labeling sweeps (`mmand::components`) plus string-based frequency tables (`base::table(ccc)`) and allocated two 4D arrays (`dim(img) x Nh`).
@@ -255,20 +334,23 @@ r4d <- readNifti(r4d_path)
 m3a <- readNifti(m3a_path)
 
 t_sm3d <- system.time(sm3 <- smoothest(z_nii, m_nii, verbose = FALSE))["elapsed"]
-t_sm4d <- system.time(sm4 <- smoothest(r4d, m3a, dof = 22, verbose = FALSE))["elapsed"]
+t_sm4d <- system.time(sm4 <- smoothest(r4d, m3a, dof = 22, nonstationary = TRUE, verbose = FALSE))["elapsed"]
 t_1s   <- system.time(ptfce(z_nii, m_nii, Rd = Rd, V = V, resels = sm3$resels,
                             Nh = 100, legacy = TRUE, verbose = FALSE))["elapsed"]
 t_2s   <- system.time(ptfce(z_nii, m_nii, Rd = Rd, V = V, resels = sm3$resels,
                             sided = "two.sided", dh = 0.05, verbose = FALSE))["elapsed"]
+t_2s_ns <- system.time(ptfce(z_nii, m3a, local_smoothness = sm4,
+                             sided = "two.sided", dh = 0.05, nonstationary = TRUE, verbose = FALSE))["elapsed"]
 
 bench_df <- data.frame(
   Operation = c(
     "3D smoothest() (301,461 mask voxels)",
-    "4D smoothest() (301,461 mask voxels x 25 volumes)",
+    "4D smoothest(..., nonstationary = TRUE) (301,461 mask voxels x 25 volumes)",
     "1-sided ptfce() (legacy Nh = 100)",
-    "Bi-sided ptfce() (sided = 'two.sided', dh = 0.05)"
+    "Bi-sided ptfce() (sided = 'two.sided', dh = 0.05, stationary)",
+    "Bi-sided ptfce() (sided = 'two.sided', dh = 0.05, nonstationary = TRUE)"
   ),
-  `Elapsed_Seconds` = c(t_sm3d, t_sm4d, t_1s, t_2s)
+  `Elapsed_Seconds` = c(t_sm3d, t_sm4d, t_1s, t_2s, t_2s_ns)
 )
 knitr::kable(bench_df, digits = 4, caption = "Wall-clock execution times on whole-brain test volumes.")
 ```
@@ -282,7 +364,7 @@ knitr::kable(bench_df, digits = 4, caption = "Wall-clock execution times on whol
 ```r
 library(pTFCE)
 
-# Accepts file paths, RNifti objects, oro.nifti objects, or 3D arrays directly:
+# Stationary bi-sided enhancement (default nonstationary = FALSE):
 res <- ptfce(
   img = "zstat1.nii.gz",
   mask = "mask.nii.gz",
@@ -294,14 +376,21 @@ res <- ptfce(
   fwe_p = c(0.05, 0.01)
 )
 
+# Non-stationary bi-sided enhancement (reusing local smoothness across contrasts):
+sm_ns <- smoothest("res4d.nii.gz", mask = "mask.nii.gz", dof = 42, nonstationary = TRUE)
+res_cope1 <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
+                   local_smoothness = sm_ns, sided = "two.sided")
+res_cope2 <- ptfce("zstat2.nii.gz", mask = "mask.nii.gz",
+                   local_smoothness = sm_ns, sided = "two.sided")
+
 # If starting from a t-statistic map instead of a Z-map:
 z_img <- t2z("spmT_0001.nii.gz", dof = 42)
-res_t <- ptfce(z_img, mask = "mask.nii.gz", Rd = ..., V = ..., resels = ..., sided = "two.sided")
+res_t <- ptfce(z_img, mask = "mask.nii.gz", local_smoothness = sm_ns, sided = "two.sided")
 ```
 
 ### Known Statistical Properties & Future Directions
 
 1. **Conservativeness of uncorrected pTFCE $p$-values in $[10^{-3}, 0.05]$:** Because `dclust` conditions on $H \ge Z_{\text{estThr}} = 1.3$ (omitting the unknown percolation factor $P(H \ge 1.3 \mid C) \le 1$), pTFCE uncorrected $p$-values are conservative in the moderate range ($p \in [10^{-3}, 0.05]$) and the enhanced field $\tilde{Z}$ is spatially smoother than the raw $Z$-map. Consequently, GRF FWER thresholding via raw `number_of_resels` is mildly conservative under stationary Gaussian noise (empirical FWER $\approx 0.02\text{–}0.03$ at nominal $\alpha = 0.05$), and naive Benjamini–Hochberg FDR on uncorrected `res$p` is also conservative.
 2. **Future enhancements planned for this fork:**
-   - **Non-stationary smoothness adjustment:** Using voxelwise local $\text{dLh}(v)$ from 4D residuals to measure cluster size in local resel volume rather than stationary voxel count.
-   - **Fast sign-flipping / parametric GRF $\max|\tilde{Z}|$ calibration:** Leveraging the ~0.15 s C++ engine to calibrate exact non-conservative FWER thresholds empirically when desired.
+   - **Full Worsley (1996) 0D–3D resel vector ($R_0, R_1, R_2, R_3$):** Accurate boundary/surface Euler characteristic FWER terms for small-volume correction (SVC) and thin anatomical ROIs.
+   - **Fast sign-flipping / parametric GRF $\max|\tilde{Z}|$ calibration:** Leveraging the sub-second C++ engine to calibrate exact non-conservative FWER thresholds empirically when desired.

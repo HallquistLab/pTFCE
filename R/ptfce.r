@@ -50,6 +50,18 @@ NULL
 #' @param legacy Logical; if \code{TRUE}, uses upstream \code{Nh}-point discrete summation
 #'   from \code{logpmin} to \code{logpmax} instead of analytical sub-\code{ZestThr}
 #'   integration with fixed \code{dh} (default: \code{FALSE}).
+#' @param nonstationary Logical; if \code{TRUE}, adjusts cluster sizes for spatial
+#'   smoothness non-stationarity using normalized local roughness weights
+#'   \code{w(v) = dLh(v) / mean(dLh)} (Worsley et al., 1999; Hayasaka et al., 2004;
+#'   Salimi-Khorshidi et al., 2011). Default is \code{FALSE} (stationary cluster voxel counts).
+#' @param local_smoothness Optional precomputed local smoothness object for non-stationary
+#'   adjustment: either a list returned by \code{smoothest(..., nonstationary = TRUE)},
+#'   or a 2D/3D image / file path containing local \code{dLh}, \code{RPV} (e.g. SPM's
+#'   \code{RPV.nii}), or positive voxel roughness weights. Supplying \code{local_smoothness}
+#'   automatically enables \code{nonstationary = TRUE} unless explicitly set to \code{FALSE}.
+#' @param smooth_fwhm Numeric scalar; spatial Gaussian smoothing FWHM in voxels applied
+#'   within the mask to regularize voxelwise derivative statistics when estimating
+#'   non-stationary smoothness (default: \code{3.0}; Salimi-Khorshidi et al., 2011).
 #'
 #' @details
 #' By default (\code{legacy = FALSE}, \code{Nh = NULL}), \code{ptfce()} evaluates the
@@ -69,6 +81,13 @@ NULL
 #'   \item \code{$logp} contains \code{-log(p)}.
 #' }
 #'
+#' When \code{nonstationary = TRUE} (ideally paired with 4D \code{residual} and \code{dof},
+#' or a precomputed \code{local_smoothness} map), each supra-threshold cluster's extent is
+#' measured in local resel-scaled voxel units \eqn{\tilde{c}(\mathcal{C}) = \sum_{v \in \mathcal{C}} w(v)}
+#' rather than raw voxel count. Smooth brain regions (\eqn{w(v) < 1}) are appropriately
+#' tempered against noise-blob inflation, while rougher regions (\eqn{w(v) > 1}, e.g.
+#' subcortex) gain sensitivity for compact true signals.
+#'
 #' @return An object of class \code{"ptfce"} (a list) containing:
 #' \itemize{
 #'   \item \strong{p}: Uncorrected pTFCE-enhanced p-values (same image class as \code{img}).
@@ -80,6 +99,8 @@ NULL
 #'   \item \strong{fwe.Z}: Named numeric vector of GRF FWER Z-score thresholds corresponding
 #'     to \code{fwe_p}.
 #'   \item \strong{sided}: Enhancement sidedness used.
+#'   \item \strong{nonstationary}: Logical indicating whether non-stationary smoothness
+#'     adjustment was applied.
 #' }
 #'
 #' @export
@@ -89,8 +110,11 @@ NULL
 #' # Standard bi-sided fMRI enhancement using 4D residuals for smoothness:
 #' res <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
 #'              residual = "res4d.nii.gz", dof = 42, sided = "two.sided")
-#' sig_map <- res$Z
-#' sig_map[abs(sig_map) < res$fwer0.05.Z] <- 0
+#'
+#' # With non-stationary smoothness adjustment from 4D residuals:
+#' res_ns <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
+#'                 residual = "res4d.nii.gz", dof = 42,
+#'                 sided = "two.sided", nonstationary = TRUE)
 #' }
 ptfce <- function(img,
                   mask = NULL,
@@ -108,8 +132,19 @@ ptfce <- function(img,
                   dh = 0.05,
                   connectivity = 6L,
                   fwe_p = 0.05,
-                  legacy = FALSE) {
+                  legacy = FALSE,
+                  nonstationary = FALSE,
+                  local_smoothness = NULL,
+                  smooth_fwhm = 3.0) {
   sided <- match.arg(sided)
+  if (!is_missing_arg(local_smoothness) && missing(nonstationary)) {
+    nonstationary <- TRUE
+  }
+  nonstationary <- isTRUE(nonstationary)
+  if (!is.numeric(smooth_fwhm) || length(smooth_fwhm) != 1L || !is.finite(smooth_fwhm) || smooth_fwhm < 0) {
+    stop("`smooth_fwhm` must be a non-negative finite number.", call. = FALSE)
+  }
+
   connectivity <- as.integer(connectivity)
   if (length(connectivity) != 1L || !connectivity %in% c(6L, 18L, 26L)) {
     stop("`connectivity` must be 6, 18, or 26.", call. = FALSE)
@@ -153,28 +188,107 @@ ptfce <- function(img,
     img_arr[inside & is.infinite(img_arr)] <- 0.0
   }
 
+  normalize_local_weights <- function(w_raw) {
+    w <- numeric(length(img_arr))
+    pos <- inside & is.finite(w_raw) & (w_raw > 0)
+    if (!any(pos)) {
+      stop("`local_smoothness` contains no positive finite values inside `mask`.", call. = FALSE)
+    }
+    m_raw <- mean(w_raw[pos])
+    w[pos] <- pmin(10.0, pmax(0.1, w_raw[pos] / m_raw))
+    w[inside & !pos] <- 1.0
+    w[inside] <- w[inside] / mean(w[inside])
+    w
+  }
+
+  mask_clean <- array(as.numeric(inside), dim = d3)
   autosmooth <- FALSE
+  voxel_weights <- NULL
+  smooth_computed <- NULL
+
+  # If a precomputed smoothest(..., nonstationary = TRUE) list was supplied, reuse its global parameters if needed
+  if (is.list(local_smoothness) && all(c("volume", "dLh", "resels") %in% names(local_smoothness))) {
+    if (is_missing_arg(Rd) || is_missing_arg(V)) {
+      autosmooth <- TRUE
+      V <- as.numeric(local_smoothness$volume)[1L]
+      Rd <- as.numeric(local_smoothness$dLh)[1L] * V
+      resels <- as.numeric(local_smoothness$resels)[1L]
+    }
+  }
+
   if (is_missing_arg(Rd) || is_missing_arg(V)) {
     autosmooth <- TRUE
-    mask_clean <- array(as.numeric(inside), dim = d3)
+    need_local_here <- nonstationary && is_missing_arg(local_smoothness)
     if (!is_missing_arg(residual)) {
       if (!is_missing_arg(dof)) {
-        smooth <- smoothest(residual, mask_clean, dof = dof, verbose = verbose)
+        smooth_computed <- smoothest(
+          residual, mask_clean, dof = dof, verbose = verbose,
+          nonstationary = need_local_here, smooth_fwhm = smooth_fwhm
+        )
       } else {
         warning("Residual supplied without `dof`: defaulting back to Z-score map smoothness estimation.")
-        smooth <- smoothest(img_arr, mask_clean, verbose = verbose)
+        if (need_local_here) {
+          warning("`nonstationary = TRUE` without valid 4D `residual` + `dof`: estimating local smoothness from 3D Z-map is noisy and signal-sensitive; 4D residuals are strongly recommended.")
+        }
+        smooth_computed <- smoothest(
+          img_arr, mask_clean, verbose = verbose,
+          nonstationary = need_local_here, smooth_fwhm = if (need_local_here) max(smooth_fwhm, 4.0) else smooth_fwhm
+        )
       }
     } else {
-      smooth <- smoothest(img_arr, mask_clean, verbose = verbose)
+      if (need_local_here) {
+        warning("`nonstationary = TRUE` without 4D `residual` or `local_smoothness`: estimating local smoothness from 3D Z-map is noisy and signal-sensitive; 4D residuals are strongly recommended.")
+      }
+      smooth_computed <- smoothest(
+        img_arr, mask_clean, verbose = verbose,
+        nonstationary = need_local_here, smooth_fwhm = if (need_local_here) max(smooth_fwhm, 4.0) else smooth_fwhm
+      )
     }
-    V <- smooth$volume
-    Rd <- smooth$dLh * V
-    resels <- smooth$resels
+    V <- smooth_computed$volume
+    Rd <- smooth_computed$dLh * V
+    resels <- smooth_computed$resels
   } else {
     V <- as.numeric(V)[1L]
     Rd <- as.numeric(Rd)[1L]
     if (!is.finite(V) || V <= 0 || !is.finite(Rd) || Rd <= 0) {
       stop("`V` and `Rd` must be positive finite numbers.", call. = FALSE)
+    }
+  }
+
+  if (nonstationary) {
+    if (!is_missing_arg(local_smoothness)) {
+      if (is.list(local_smoothness)) {
+        w_src <- if (!is.null(local_smoothness$voxel_weights)) {
+          local_smoothness$voxel_weights
+        } else if (!is.null(local_smoothness$dLh_map)) {
+          local_smoothness$dLh_map
+        } else if (!is.null(local_smoothness$rpv_map)) {
+          local_smoothness$rpv_map
+        } else {
+          stop("`local_smoothness` list must contain `voxel_weights`, `dLh_map`, or `rpv_map`.", call. = FALSE)
+        }
+        w_meta <- read_volume_input(w_src, arg_name = "local_smoothness", allow_4d = FALSE)
+      } else {
+        w_meta <- read_volume_input(local_smoothness, arg_name = "local_smoothness", allow_4d = FALSE)
+      }
+      if (!identical(w_meta$dim3, d3)) {
+        stop(sprintf("`local_smoothness` dimensions (%s) do not match `img` dimensions (%s).",
+                     paste(w_meta$dim3, collapse = "x"), paste(d3, collapse = "x")), call. = FALSE)
+      }
+      voxel_weights <- normalize_local_weights(as.numeric(w_meta$data))
+    } else if (!is.null(smooth_computed) && !is.null(smooth_computed$voxel_weights)) {
+      voxel_weights <- normalize_local_weights(as.numeric(smooth_computed$voxel_weights))
+    } else {
+      # User supplied explicit V and Rd, plus nonstationary = TRUE without local_smoothness
+      if (!is_missing_arg(residual) && !is_missing_arg(dof)) {
+        sm_loc <- smoothest(residual, mask_clean, dof = dof, verbose = verbose,
+                            nonstationary = TRUE, smooth_fwhm = smooth_fwhm)
+      } else {
+        warning("`nonstationary = TRUE` without 4D `residual` or `local_smoothness`: estimating local smoothness from 3D Z-map is noisy and signal-sensitive; 4D residuals are strongly recommended.")
+        sm_loc <- smoothest(img_arr, mask_clean, verbose = verbose,
+                            nonstationary = TRUE, smooth_fwhm = max(smooth_fwhm, 4.0))
+      }
+      voxel_weights <- normalize_local_weights(as.numeric(sm_loc$voxel_weights))
     }
   }
 
@@ -243,7 +357,8 @@ ptfce <- function(img,
   }
 
   if (verbose) {
-    cat(sprintf("* Performing pTFCE (%s)...\n", sided))
+    mode_lbl <- if (nonstationary) paste0(sided, ", non-stationary") else sided
+    cat(sprintf("* Performing pTFCE (%s)...\n", mode_lbl))
   }
 
   n_total <- length(img_arr)
@@ -265,7 +380,8 @@ ptfce <- function(img,
       dh_legacy = dh_legacy,
       ZestThr = ZestThr,
       connectivity = connectivity,
-      analytical_subthr = analytical_subthr
+      analytical_subthr = analytical_subthr,
+      voxel_weights = voxel_weights
     )
     nlp
   }
@@ -397,7 +513,8 @@ ptfce <- function(img,
     number_of_resels = number_of_resels,
     fwer0.05.Z = fwer0.05.Z,
     fwe.Z = fwe_Z,
-    sided = sided
+    sided = sided,
+    nonstationary = nonstationary
   )
   class(out) <- "ptfce"
   out
@@ -405,7 +522,8 @@ ptfce <- function(img,
 
 #' @export
 print.ptfce <- function(x, ...) {
-  cat("pTFCE result (", x$sided, ")\n", sep = "")
+  ns_lbl <- if (isTRUE(x$nonstationary)) ", non-stationary" else ""
+  cat("pTFCE result (", x$sided, ns_lbl, ")\n", sep = "")
   cat("  Number of resels : ", format(x$number_of_resels, digits = 5), "\n", sep = "")
   cat("  FWER 0.05 Z-thr  : ", format(x$fwer0.05.Z, digits = 5), "\n", sep = "")
   invisible(x)
@@ -518,16 +636,25 @@ pvox.clust <- function(V, Rd, c, actH, ZestThr = 1.3) {
   p
 }
 
-#' Estimate global image smoothness
+#' Estimate global (and optionally local non-stationary) image smoothness
 #'
 #' Fast C++ port of FSL's \code{smoothest} tool (Jenkinson, FMRIB Tech Report TR00DF1)
-#' supporting both 2D/3D Z-score maps and 4D GLM residual time-series images.
+#' supporting both 2D/3D Z-score maps and 4D GLM residual time-series images, with
+#' optional regularized voxelwise local roughness estimation (\code{dLh_map}, \code{rpv_map},
+#' and normalized \code{voxel_weights}) for non-stationary cluster inference
+#' (Worsley et al., 1999; Salimi-Khorshidi et al., 2011).
 #'
 #' @param img A 2D/3D Z-score image or 4D residual image (\code{RNifti}, \code{oro.nifti},
 #'   \code{array}, or file path).
 #' @param mask Spatial mask image (\code{RNifti}, \code{oro.nifti}, \code{array}, or file path).
 #' @param dof Residual degrees of freedom (required when \code{img} is a 4D residual image).
 #' @param verbose Logical; print diagnostic messages if \code{TRUE} (default).
+#' @param nonstationary Logical; if \code{TRUE}, also compute spatially regularized
+#'   voxelwise \code{dLh_map}, \code{rpv_map} (RESELs per voxel), and mean-1 normalized
+#'   \code{voxel_weights} inside the mask (default: \code{FALSE}).
+#' @param smooth_fwhm Spatial Gaussian smoothing FWHM in voxels applied within the mask
+#'   to regularize voxelwise derivative sufficient statistics when \code{nonstationary = TRUE}
+#'   (default: \code{3.0}).
 #'
 #' @return A list containing:
 #' \itemize{
@@ -536,10 +663,17 @@ pvox.clust <- function(V, Rd, c, actH, ZestThr = 1.3) {
 #'   \item \strong{FWHM}: Full-width at half-maximum in x, y, z (voxels).
 #'   \item \strong{dLh}: Determinant of \eqn{\Lambda^{1/2}} (\code{voxels^-3}).
 #'   \item \strong{resels}: Resel size in voxels per resel.
+#'   \item \strong{dLh_map}, \strong{rpv_map}, \strong{voxel_weights}: Included when
+#'     \code{nonstationary = TRUE}, preserving the spatial image class of \code{mask}.
 #' }
 #' @export
-smoothest <- function(img, mask, dof = NA, verbose = TRUE) {
+smoothest <- function(img, mask, dof = NA, verbose = TRUE,
+                      nonstationary = FALSE, smooth_fwhm = 3.0) {
   if (verbose) cat("* Estimating smoothness based on the data...\n")
+  nonstationary <- isTRUE(nonstationary)
+  if (!is.numeric(smooth_fwhm) || length(smooth_fwhm) != 1L || !is.finite(smooth_fwhm) || smooth_fwhm < 0) {
+    stop("`smooth_fwhm` must be a non-negative finite number.", call. = FALSE)
+  }
 
   img_meta <- read_volume_input(img, arg_name = "img", allow_4d = TRUE)
   d3 <- img_meta$dim3
@@ -560,13 +694,18 @@ smoothest <- function(img, mask, dof = NA, verbose = TRUE) {
     warning("Using 2D image mode.")
   }
 
+  dof_corr <- if (nt > 1L) interpolate(as.numeric(dof)[1L]) else 1.0
+
   cpp_res <- smoothest_cpp(
     img = img_meta$data,
     mask = mask_meta$data,
     nx = d3[1L],
     ny = d3[2L],
     nz = d3[3L],
-    nt = nt
+    nt = nt,
+    compute_local = nonstationary,
+    smooth_fwhm = smooth_fwhm,
+    dof_correction = dof_corr
   )
 
   usez <- cpp_res$usez
@@ -604,7 +743,7 @@ smoothest <- function(img, mask, dof = NA, verbose = TRUE) {
   }
 
   if (nt > 1L) {
-    dLh <- dLh * interpolate(as.numeric(dof)[1L])
+    dLh <- dLh * dof_corr
   }
 
   FWHM <- c(
@@ -615,13 +754,22 @@ smoothest <- function(img, mask, dof = NA, verbose = TRUE) {
 
   resels <- FWHM[1L] * FWHM[2L] * (if (usez) FWHM[3L] else 1.0)
 
-  list(
+  out <- list(
     volume = cpp_res$volume,
     sigmasq = sigmasq,
     FWHM = FWHM,
     dLh = unname(dLh),
     resels = unname(resels)
   )
+
+  if (nonstationary) {
+    rpv_scale <- (4.0 * log(2.0))^(if (usez) 1.5 else 1.0)
+    out$dLh_map <- wrap_volume_output(cpp_res$dLh_map, mask_meta)
+    out$rpv_map <- wrap_volume_output(cpp_res$dLh_map / rpv_scale, mask_meta)
+    out$voxel_weights <- wrap_volume_output(cpp_res$voxel_weights, mask_meta)
+  }
+
+  out
 }
 
 interpolate <- function(v) {

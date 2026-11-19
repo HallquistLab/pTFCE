@@ -54,8 +54,8 @@ BEGIN_RCPP
 END_RCPP
 }
 // ptfce_tail_cpp
-NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask, int nx, int ny, int nz, double V, double Rd, NumericVector threshs, NumericVector weights, double dh_legacy, double ZestThr, int connectivity, bool analytical_subthr);
-RcppExport SEXP _pTFCE_ptfce_tail_cpp(SEXP imgSEXP, SEXP maskSEXP, SEXP nxSEXP, SEXP nySEXP, SEXP nzSEXP, SEXP VSEXP, SEXP RdSEXP, SEXP threshsSEXP, SEXP weightsSEXP, SEXP dh_legacySEXP, SEXP ZestThrSEXP, SEXP connectivitySEXP, SEXP analytical_subthrSEXP) {
+NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask, int nx, int ny, int nz, double V, double Rd, NumericVector threshs, NumericVector weights, double dh_legacy, double ZestThr, int connectivity, bool analytical_subthr, Nullable<NumericVector> voxel_weights);
+RcppExport SEXP _pTFCE_ptfce_tail_cpp(SEXP imgSEXP, SEXP maskSEXP, SEXP nxSEXP, SEXP nySEXP, SEXP nzSEXP, SEXP VSEXP, SEXP RdSEXP, SEXP threshsSEXP, SEXP weightsSEXP, SEXP dh_legacySEXP, SEXP ZestThrSEXP, SEXP connectivitySEXP, SEXP analytical_subthrSEXP, SEXP voxel_weightsSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -72,13 +72,14 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< double >::type ZestThr(ZestThrSEXP);
     Rcpp::traits::input_parameter< int >::type connectivity(connectivitySEXP);
     Rcpp::traits::input_parameter< bool >::type analytical_subthr(analytical_subthrSEXP);
-    rcpp_result_gen = Rcpp::wrap(ptfce_tail_cpp(img, mask, nx, ny, nz, V, Rd, threshs, weights, dh_legacy, ZestThr, connectivity, analytical_subthr));
+    Rcpp::traits::input_parameter< Nullable<NumericVector> >::type voxel_weights(voxel_weightsSEXP);
+    rcpp_result_gen = Rcpp::wrap(ptfce_tail_cpp(img, mask, nx, ny, nz, V, Rd, threshs, weights, dh_legacy, ZestThr, connectivity, analytical_subthr, voxel_weights));
     return rcpp_result_gen;
 END_RCPP
 }
 // smoothest_cpp
-List smoothest_cpp(NumericVector img, NumericVector mask, int nx, int ny, int nz, int nt);
-RcppExport SEXP _pTFCE_smoothest_cpp(SEXP imgSEXP, SEXP maskSEXP, SEXP nxSEXP, SEXP nySEXP, SEXP nzSEXP, SEXP ntSEXP) {
+List smoothest_cpp(NumericVector img, NumericVector mask, int nx, int ny, int nz, int nt, bool compute_local, double smooth_fwhm, double dof_correction);
+RcppExport SEXP _pTFCE_smoothest_cpp(SEXP imgSEXP, SEXP maskSEXP, SEXP nxSEXP, SEXP nySEXP, SEXP nzSEXP, SEXP ntSEXP, SEXP compute_localSEXP, SEXP smooth_fwhmSEXP, SEXP dof_correctionSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -88,7 +89,10 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< int >::type ny(nySEXP);
     Rcpp::traits::input_parameter< int >::type nz(nzSEXP);
     Rcpp::traits::input_parameter< int >::type nt(ntSEXP);
-    rcpp_result_gen = Rcpp::wrap(smoothest_cpp(img, mask, nx, ny, nz, nt));
+    Rcpp::traits::input_parameter< bool >::type compute_local(compute_localSEXP);
+    Rcpp::traits::input_parameter< double >::type smooth_fwhm(smooth_fwhmSEXP);
+    Rcpp::traits::input_parameter< double >::type dof_correction(dof_correctionSEXP);
+    rcpp_result_gen = Rcpp::wrap(smoothest_cpp(img, mask, nx, ny, nz, nt, compute_local, smooth_fwhm, dof_correction));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -97,8 +101,8 @@ static const R_CallMethodDef CallEntries[] = {
     {"_pTFCE_es_cpp", (DL_FUNC) &_pTFCE_es_cpp, 3},
     {"_pTFCE_neglog_pvox_clust_cpp", (DL_FUNC) &_pTFCE_neglog_pvox_clust_cpp, 5},
     {"_pTFCE_dvox_clust_cpp", (DL_FUNC) &_pTFCE_dvox_clust_cpp, 5},
-    {"_pTFCE_ptfce_tail_cpp", (DL_FUNC) &_pTFCE_ptfce_tail_cpp, 13},
-    {"_pTFCE_smoothest_cpp", (DL_FUNC) &_pTFCE_smoothest_cpp, 6},
+    {"_pTFCE_ptfce_tail_cpp", (DL_FUNC) &_pTFCE_ptfce_tail_cpp, 14},
+    {"_pTFCE_smoothest_cpp", (DL_FUNC) &_pTFCE_smoothest_cpp, 9},
     {NULL, NULL, 0}
 };
 

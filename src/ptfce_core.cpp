@@ -236,6 +236,105 @@ inline double neglog_pvox_clust_cached(double actH, double ZestThr,
   return diff;
 }
 
+// 4-point cubic Lagrange interpolation on an equispaced grid y[0 .. M-1] (M >= 4)
+inline double interp_cubic_equispaced(const std::vector<double> &y,
+                                      double x_min, double inv_dx, double x) {
+  int M = static_cast<int>(y.size());
+  double u = (x - x_min) * inv_dx;
+  if (u <= 0.0) return y[0];
+  if (u >= static_cast<double>(M - 1)) return y[M - 1];
+
+  int i1 = static_cast<int>(std::floor(u));
+  if (i1 < 1) i1 = 1;
+  if (i1 > M - 3) i1 = M - 3;
+
+  double t = u - static_cast<double>(i1);
+  double w0 = -t * (t - 1.0) * (t - 2.0) * (1.0 / 6.0);
+  double w1 =  (t + 1.0) * (t - 1.0) * (t - 2.0) * 0.5;
+  double w2 = -(t + 1.0) * t * (t - 2.0) * 0.5;
+  double w3 =  (t + 1.0) * t * (t - 1.0) * (1.0 / 6.0);
+
+  return w0 * y[i1 - 1] + w1 * y[i1] + w2 * y[i1 + 1] + w3 * y[i1 + 2];
+}
+
+// Separable 3D Gaussian convolution (zero-padded boundaries; used for normalized mask convolution)
+void smooth_3d_separable(std::vector<double> &vol, int nx, int ny, int nz, double fwhm_vox) {
+  if (fwhm_vox <= 0.0) return;
+  double sigma = fwhm_vox / std::sqrt(8.0 * std::log(2.0));
+  if (sigma < 1e-4) return;
+  int rad = std::max(1, static_cast<int>(std::ceil(3.5 * sigma)));
+  std::vector<double> kern(2 * rad + 1);
+  double ksum = 0.0;
+  for (int k = -rad; k <= rad; ++k) {
+    double w = std::exp(-0.5 * (k * k) / (sigma * sigma));
+    kern[k + rad] = w;
+    ksum += w;
+  }
+  for (double &w : kern) w /= ksum;
+
+  int nxy = nx * ny;
+  std::vector<double> tmp(vol.size(), 0.0);
+
+  // Pass X
+  if (nx > 1) {
+    for (int z = 0; z < nz; ++z) {
+      for (int y = 0; y < ny; ++y) {
+        int base = y * nx + z * nxy;
+        for (int x = 0; x < nx; ++x) {
+          double acc = 0.0;
+          int k_lo = std::max(-rad, -x);
+          int k_hi = std::min(rad, nx - 1 - x);
+          for (int k = k_lo; k <= k_hi; ++k) {
+            acc += kern[k + rad] * vol[base + x + k];
+          }
+          tmp[base + x] = acc;
+        }
+      }
+    }
+    vol.swap(tmp);
+  }
+
+  // Pass Y
+  if (ny > 1) {
+    std::fill(tmp.begin(), tmp.end(), 0.0);
+    for (int z = 0; z < nz; ++z) {
+      int z_off = z * nxy;
+      for (int y = 0; y < ny; ++y) {
+        int k_lo = std::max(-rad, -y);
+        int k_hi = std::min(rad, ny - 1 - y);
+        for (int x = 0; x < nx; ++x) {
+          double acc = 0.0;
+          for (int k = k_lo; k <= k_hi; ++k) {
+            acc += kern[k + rad] * vol[z_off + (y + k) * nx + x];
+          }
+          tmp[z_off + y * nx + x] = acc;
+        }
+      }
+    }
+    vol.swap(tmp);
+  }
+
+  // Pass Z
+  if (nz > 1) {
+    std::fill(tmp.begin(), tmp.end(), 0.0);
+    for (int z = 0; z < nz; ++z) {
+      int k_lo = std::max(-rad, -z);
+      int k_hi = std::min(rad, nz - 1 - z);
+      for (int y = 0; y < ny; ++y) {
+        int y_off = y * nx;
+        for (int x = 0; x < nx; ++x) {
+          double acc = 0.0;
+          for (int k = k_lo; k <= k_hi; ++k) {
+            acc += kern[k + rad] * vol[(z + k) * nxy + y_off + x];
+          }
+          tmp[z * nxy + y_off + x] = acc;
+        }
+      }
+    }
+    vol.swap(tmp);
+  }
+}
+
 } // namespace
 
 // [[Rcpp::export]]
@@ -320,18 +419,25 @@ NumericVector dvox_clust_cpp(NumericVector h, double V, double Rd, double c,
 }
 
 // Single-tail pTFCE enhancement using single-pass descending Disjoint-Set Union (Union-Find)
+// Supports both stationary integer cluster sizes and non-stationary continuous resel weights.
 // [[Rcpp::export]]
 NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask,
                              int nx, int ny, int nz,
                              double V, double Rd,
                              NumericVector threshs, NumericVector weights,
                              double dh_legacy, double ZestThr,
-                             int connectivity, bool analytical_subthr) {
+                             int connectivity, bool analytical_subthr,
+                             Nullable<NumericVector> voxel_weights = R_NilValue) {
   int n = nx * ny * nz;
   int nth = threshs.size();
   double logV = std::log(V);
   double logRd = std::log(Rd);
   double x_zest = -R::pnorm5(ZestThr, 0.0, 1.0, 0, 1);
+  bool use_nonstat = voxel_weights.isNotNull();
+  NumericVector vw;
+  if (use_nonstat) {
+    vw = NumericVector(voxel_weights);
+  }
 
   // Build neighbor offsets for 6, 18, or 26 connectivity
   std::vector<int> dx, dy, dz;
@@ -379,7 +485,6 @@ NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask,
     for (int i = 0; i < n; ++i) {
       if (!mask[i]) continue;
       double val = img[i];
-      // Count thresholds in [0, first_cc_hi) with threshs[hi] < val
       int k = static_cast<int>(
         std::lower_bound(threshs.begin(), threshs.begin() + first_cc_hi, val) - threshs.begin()
       );
@@ -415,77 +520,201 @@ NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask,
       return r;
     };
 
-    std::unordered_map<int, double> log_den_cache;
-    std::unordered_map<int, double> step_val_cache;
-    log_den_cache.reserve(512);
-    step_val_cache.reserve(256);
-
     const int nxy = nx * ny;
     size_t ptr = 0;
     const size_t n_ord = order.size();
 
-    for (int hi = nth - 1; hi >= first_cc_hi; --hi) {
-      if (hi % 64 == 0) Rcpp::checkUserInterrupt();
-      double h = threshs[hi];
-      double w = weights[hi];
+    if (!use_nonstat) {
+      // Exact stationary path (integer cluster sizes)
+      std::unordered_map<int, double> log_den_cache;
+      std::unordered_map<int, double> step_val_cache;
+      log_den_cache.reserve(512);
+      step_val_cache.reserve(256);
 
-      while (ptr < n_ord && img[order[ptr]] > h) {
-        int idx = order[ptr++];
-        parent[idx] = idx;
-        comp_sz[idx] = 1;
+      for (int hi = nth - 1; hi >= first_cc_hi; --hi) {
+        if (hi % 64 == 0) Rcpp::checkUserInterrupt();
+        double h = threshs[hi];
+        double w = weights[hi];
 
-        int z = idx / nxy;
-        int rem = idx % nxy;
-        int y = rem / nx;
-        int x = rem % nx;
+        while (ptr < n_ord && img[order[ptr]] > h) {
+          int idx = order[ptr++];
+          parent[idx] = idx;
+          comp_sz[idx] = 1;
 
-        for (int d = 0; d < n_nb; ++d) {
-          int xi = x + dx[d];
-          int yi = y + dy[d];
-          int zi = z + dz[d];
-          if (xi >= 0 && xi < nx && yi >= 0 && yi < ny && zi >= 0 && zi < nz) {
-            int nidx = xi + yi * nx + zi * nxy;
-            if (parent[nidx] != -1) {
-              int ra = find_root(idx);
-              int rb = find_root(nidx);
-              if (ra != rb) {
-                if (comp_sz[ra] < comp_sz[rb]) std::swap(ra, rb);
-                parent[rb] = ra;
-                comp_sz[ra] += comp_sz[rb];
+          int z = idx / nxy;
+          int rem = idx % nxy;
+          int y = rem / nx;
+          int x = rem % nx;
+
+          for (int d = 0; d < n_nb; ++d) {
+            int xi = x + dx[d];
+            int yi = y + dy[d];
+            int zi = z + dz[d];
+            if (xi >= 0 && xi < nx && yi >= 0 && yi < ny && zi >= 0 && zi < nz) {
+              int nidx = xi + yi * nx + zi * nxy;
+              if (parent[nidx] != -1) {
+                int ra = find_root(idx);
+                int rb = find_root(nidx);
+                if (ra != rb) {
+                  if (comp_sz[ra] < comp_sz[rb]) std::swap(ra, rb);
+                  parent[rb] = ra;
+                  comp_sz[ra] += comp_sz[rb];
+                }
               }
             }
           }
         }
+
+        if (ptr == 0) continue;
+
+        step_val_cache.clear();
+        for (size_t k = 0; k < ptr; ++k) {
+          int idx = order[k];
+          int r = find_root(idx);
+          if (r == idx) {
+            int c = comp_sz[r];
+            if (step_val_cache.find(c) == step_val_cache.end()) {
+              double c23 = std::pow(static_cast<double>(c), 2.0 / 3.0);
+              double lden;
+              auto it = log_den_cache.find(c);
+              if (it == log_den_cache.end()) {
+                lden = log_integral_tail(ZestThr, logV, logRd, c23);
+                log_den_cache[c] = lden;
+              } else {
+                lden = it->second;
+              }
+              double nlp = neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c23, lden);
+              step_val_cache[c] = w * nlp;
+            }
+          }
+        }
+
+        for (size_t k = 0; k < ptr; ++k) {
+          int idx = order[k];
+          int c = comp_sz[find_root(idx)];
+          accum[idx] += step_val_cache[c];
+        }
+      }
+    } else {
+      // Non-stationary path: continuous resel-weighted cluster mass sum_{v in C} vw[v]
+      std::vector<double> comp_mass(n, 0.0);
+      std::vector<double> root_step_val(n, 0.0);
+
+      // Precompute 256-node cubic interpolation table for log_den(log(c)) across all valid masses
+      double c_min = 1e30, c_max = 0.0;
+      for (size_t k = 0; k < n_ord; ++k) {
+        double wi = std::max(1e-4, vw[order[k]]);
+        if (wi < c_min) c_min = wi;
+        c_max += wi;
+      }
+      if (n_ord > 0 && c_max <= c_min) {
+        c_max = c_min * 2.0;
       }
 
-      if (ptr == 0) continue;
+      const int N_DEN_GRID = 256;
+      std::vector<double> den_grid(N_DEN_GRID, 0.0);
+      double s_min = (n_ord > 0) ? std::log(c_min * 0.95) : -3.0;
+      double s_max = (n_ord > 0) ? std::log(c_max * 1.05 + 1.0) : 12.0;
+      double ds_den = (s_max - s_min) / static_cast<double>(N_DEN_GRID - 1);
+      double inv_ds_den = 1.0 / ds_den;
 
-      step_val_cache.clear();
-      for (size_t k = 0; k < ptr; ++k) {
-        int idx = order[k];
-        int r = find_root(idx);
-        if (r == idx) {
-          int c = comp_sz[r];
-          if (step_val_cache.find(c) == step_val_cache.end()) {
-            double c23 = std::pow(static_cast<double>(c), 2.0 / 3.0);
-            double lden;
-            auto it = log_den_cache.find(c);
-            if (it == log_den_cache.end()) {
-              lden = log_integral_tail(ZestThr, logV, logRd, c23);
-              log_den_cache[c] = lden;
-            } else {
-              lden = it->second;
-            }
-            double nlp = neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c23, lden);
-            step_val_cache[c] = w * nlp;
-          }
+      if (n_ord > 0) {
+        for (int g = 0; g < N_DEN_GRID; ++g) {
+          double s = s_min + g * ds_den;
+          double c23 = std::exp((2.0 / 3.0) * s);
+          den_grid[g] = log_integral_tail(ZestThr, logV, logRd, c23);
         }
       }
 
-      for (size_t k = 0; k < ptr; ++k) {
-        int idx = order[k];
-        int c = comp_sz[find_root(idx)];
-        accum[idx] += step_val_cache[c];
+      std::vector<int> roots;
+      roots.reserve(256);
+      const int N_STEP_GRID = 64;
+      std::vector<double> step_grid(N_STEP_GRID, 0.0);
+
+      for (int hi = nth - 1; hi >= first_cc_hi; --hi) {
+        if (hi % 64 == 0) Rcpp::checkUserInterrupt();
+        double h = threshs[hi];
+        double w = weights[hi];
+
+        while (ptr < n_ord && img[order[ptr]] > h) {
+          int idx = order[ptr++];
+          parent[idx] = idx;
+          comp_sz[idx] = 1;
+          comp_mass[idx] = std::max(1e-4, vw[idx]);
+
+          int z = idx / nxy;
+          int rem = idx % nxy;
+          int y = rem / nx;
+          int x = rem % nx;
+
+          for (int d = 0; d < n_nb; ++d) {
+            int xi = x + dx[d];
+            int yi = y + dy[d];
+            int zi = z + dz[d];
+            if (xi >= 0 && xi < nx && yi >= 0 && yi < ny && zi >= 0 && zi < nz) {
+              int nidx = xi + yi * nx + zi * nxy;
+              if (parent[nidx] != -1) {
+                int ra = find_root(idx);
+                int rb = find_root(nidx);
+                if (ra != rb) {
+                  if (comp_sz[ra] < comp_sz[rb]) std::swap(ra, rb);
+                  parent[rb] = ra;
+                  comp_sz[ra] += comp_sz[rb];
+                  comp_mass[ra] += comp_mass[rb];
+                }
+              }
+            }
+          }
+        }
+
+        if (ptr == 0) continue;
+
+        roots.clear();
+        double r_cmin = 1e30, r_cmax = 0.0;
+        for (size_t k = 0; k < ptr; ++k) {
+          int idx = order[k];
+          int r = find_root(idx);
+          if (r == idx) {
+            roots.push_back(r);
+            double cm = comp_mass[r];
+            if (cm < r_cmin) r_cmin = cm;
+            if (cm > r_cmax) r_cmax = cm;
+          }
+        }
+
+        if (static_cast<int>(roots.size()) <= N_STEP_GRID || r_cmax <= r_cmin * 1.0001) {
+          // Few active clusters: evaluate exact quadrature directly for each root
+          for (int r : roots) {
+            double cm = comp_mass[r];
+            double log_cm = std::log(cm);
+            double c23 = std::exp((2.0 / 3.0) * log_cm);
+            double lden = interp_cubic_equispaced(den_grid, s_min, inv_ds_den, log_cm);
+            double nlp = neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c23, lden);
+            root_step_val[r] = w * nlp;
+          }
+        } else {
+          // Many active clusters: build 64-node cubic spline table in log(c) for this h
+          double ls_lo = std::log(r_cmin);
+          double ls_hi = std::log(r_cmax);
+          double ds_step = (ls_hi - ls_lo) / static_cast<double>(N_STEP_GRID - 1);
+          double inv_ds_step = 1.0 / ds_step;
+          for (int g = 0; g < N_STEP_GRID; ++g) {
+            double s = ls_lo + g * ds_step;
+            double c23 = std::exp((2.0 / 3.0) * s);
+            double lden = interp_cubic_equispaced(den_grid, s_min, inv_ds_den, s);
+            step_grid[g] = w * neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c23, lden);
+          }
+          for (int r : roots) {
+            double log_cm = std::log(comp_mass[r]);
+            double val = interp_cubic_equispaced(step_grid, ls_lo, inv_ds_step, log_cm);
+            root_step_val[r] = std::max(0.0, val);
+          }
+        }
+
+        for (size_t k = 0; k < ptr; ++k) {
+          int idx = order[k];
+          accum[idx] += root_step_val[find_root(idx)];
+        }
       }
     }
   }
@@ -510,17 +739,23 @@ NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask,
 }
 
 // Fast cache-friendly C++ smoothness estimation for 2D/3D Z-maps and 4D residuals
+// Optionally computes spatially regularized local dLh(v) and normalized voxel weights
+// for non-stationary cluster size adjustment (Worsley et al., 1999; Salimi-Khorshidi et al., 2011).
 // [[Rcpp::export]]
 List smoothest_cpp(NumericVector img, NumericVector mask,
-                   int nx, int ny, int nz, int nt) {
+                   int nx, int ny, int nz, int nt,
+                   bool compute_local = false, double smooth_fwhm = 3.0,
+                   double dof_correction = 1.0) {
   int n_vox = nx * ny * nz;
   bool usez = (nz > 1);
   int nxy = nx * ny;
 
+  std::vector<unsigned char> in_mask(n_vox, 0);
   std::vector<unsigned char> active(n_vox, 0);
   for (int i = 0; i < n_vox; ++i) {
     double m = mask[i];
     if (!NumericVector::is_na(m) && std::isfinite(m) && m > 0.5) {
+      in_mask[i] = 1;
       active[i] = 1;
     }
   }
@@ -532,7 +767,6 @@ List smoothest_cpp(NumericVector img, NumericVector mask,
     // 4D residual mode: standardize each voxel along time without copying 4D array
     mean_v.assign(n_vox, 0.0);
     inv_sd_v.assign(n_vox, 0.0);
-    std::vector<unsigned char> finite_ok(n_vox, 1);
 
     // Pass 1: compute temporal means
     for (int t = 0; t < nt; ++t) {
@@ -541,7 +775,6 @@ List smoothest_cpp(NumericVector img, NumericVector mask,
         if (!active[i]) continue;
         double val = img[off + i];
         if (!std::isfinite(val)) {
-          finite_ok[i] = 0;
           active[i] = 0;
         } else {
           mean_v[i] += val;
@@ -587,10 +820,10 @@ List smoothest_cpp(NumericVector img, NumericVector mask,
     if (active[i]) mask_volume++;
   }
 
-  // Collect interior voxels where (x,y,z) and backward neighbors are all active
+  // Collect interior voxels where (x,y,z) and all backward neighbors are active (FSL global rule)
   std::vector<int> interior;
   interior.reserve(mask_volume);
-  int zstart = usez ? 1 : 0; // 0-based: z >= 1 for 3D, z == 0 for 2D
+  int zstart = usez ? 1 : 0;
   for (int z = zstart; z < nz; ++z) {
     for (int y = 1; y < ny; ++y) {
       int base = y * nx + z * nxy;
@@ -610,10 +843,62 @@ List smoothest_cpp(NumericVector img, NumericVector mask,
   double SSminus[3] = {0.0, 0.0, 0.0};
   double S2[3] = {0.0, 0.0, 0.0};
 
+  // Optional per-axis valid edge lists & voxel accumulators for local smoothness
+  std::vector<int> edges_x, edges_y, edges_z;
+  std::vector<double> vox_ss_x, vox_ss_y, vox_ss_z;
+  std::vector<double> vox_s2_x, vox_s2_y, vox_s2_z;
+
+  if (compute_local) {
+    vox_ss_x.assign(n_vox, 0.0);
+    vox_ss_y.assign(n_vox, 0.0);
+    vox_s2_x.assign(n_vox, 0.0);
+    vox_s2_y.assign(n_vox, 0.0);
+    if (usez) {
+      vox_ss_z.assign(n_vox, 0.0);
+      vox_s2_z.assign(n_vox, 0.0);
+    }
+    edges_x.reserve(mask_volume);
+    edges_y.reserve(mask_volume);
+    if (usez) edges_z.reserve(mask_volume);
+
+    for (int z = 0; z < nz; ++z) {
+      for (int y = 0; y < ny; ++y) {
+        int base = y * nx + z * nxy;
+        for (int x = 0; x < nx; ++x) {
+          int idx = base + x;
+          if (!active[idx]) continue;
+          if (x >= 1 && active[idx - 1]) edges_x.push_back(idx);
+          if (y >= 1 && active[idx - nx]) edges_y.push_back(idx);
+          if (usez && z >= 1 && active[idx - nxy]) edges_z.push_back(idx);
+        }
+      }
+    }
+
+    if (nt > 1) {
+      // Standardized time series has exact sum_t z^2 == nt - 1 at every active voxel
+      double pair_s2 = static_cast<double>(nt - 1);
+      for (int idx : edges_x) {
+        vox_s2_x[idx] += pair_s2;
+        vox_s2_x[idx - 1] += pair_s2;
+      }
+      for (int idx : edges_y) {
+        vox_s2_y[idx] += pair_s2;
+        vox_s2_y[idx - nx] += pair_s2;
+      }
+      if (usez) {
+        for (int idx : edges_z) {
+          vox_s2_z[idx] += pair_s2;
+          vox_s2_z[idx - nxy] += pair_s2;
+        }
+      }
+    }
+  }
+
   if (nt > 1) {
     for (int t = 0; t < nt; ++t) {
       if (t % 32 == 0) Rcpp::checkUserInterrupt();
       R_xlen_t off = static_cast<R_xlen_t>(t) * n_vox;
+
       for (R_xlen_t k = 0; k < N; ++k) {
         int idx = interior[k];
         double v0 = (img[off + idx] - mean_v[idx]) * inv_sd_v[idx];
@@ -630,6 +915,29 @@ List smoothest_cpp(NumericVector img, NumericVector mask,
           double vz = (img[off + idx - nxy] - mean_v[idx - nxy]) * inv_sd_v[idx - nxy];
           SSminus[2] += v0 * vz;
           S2[2] += 0.5 * (v0_sq + vz * vz);
+        }
+      }
+
+      if (compute_local) {
+        for (int idx : edges_x) {
+          double p = ((img[off + idx] - mean_v[idx]) * inv_sd_v[idx]) *
+                     ((img[off + idx - 1] - mean_v[idx - 1]) * inv_sd_v[idx - 1]);
+          vox_ss_x[idx] += p;
+          vox_ss_x[idx - 1] += p;
+        }
+        for (int idx : edges_y) {
+          double p = ((img[off + idx] - mean_v[idx]) * inv_sd_v[idx]) *
+                     ((img[off + idx - nx] - mean_v[idx - nx]) * inv_sd_v[idx - nx]);
+          vox_ss_y[idx] += p;
+          vox_ss_y[idx - nx] += p;
+        }
+        if (usez) {
+          for (int idx : edges_z) {
+            double p = ((img[off + idx] - mean_v[idx]) * inv_sd_v[idx]) *
+                       ((img[off + idx - nxy] - mean_v[idx - nxy]) * inv_sd_v[idx - nxy]);
+            vox_ss_z[idx] += p;
+            vox_ss_z[idx - nxy] += p;
+          }
         }
       }
     }
@@ -652,6 +960,117 @@ List smoothest_cpp(NumericVector img, NumericVector mask,
         S2[2] += 0.5 * (v0_sq + vz * vz);
       }
     }
+
+    if (compute_local) {
+      for (int idx : edges_x) {
+        double v0 = img[idx], v1 = img[idx - 1];
+        double p = v0 * v1, s = 0.5 * (v0 * v0 + v1 * v1);
+        vox_ss_x[idx] += p; vox_ss_x[idx - 1] += p;
+        vox_s2_x[idx] += s; vox_s2_x[idx - 1] += s;
+      }
+      for (int idx : edges_y) {
+        double v0 = img[idx], v1 = img[idx - nx];
+        double p = v0 * v1, s = 0.5 * (v0 * v0 + v1 * v1);
+        vox_ss_y[idx] += p; vox_ss_y[idx - nx] += p;
+        vox_s2_y[idx] += s; vox_s2_y[idx - nx] += s;
+      }
+      if (usez) {
+        for (int idx : edges_z) {
+          double v0 = img[idx], v1 = img[idx - nxy];
+          double p = v0 * v1, s = 0.5 * (v0 * v0 + v1 * v1);
+          vox_ss_z[idx] += p; vox_ss_z[idx - nxy] += p;
+          vox_s2_z[idx] += s; vox_s2_z[idx - nxy] += s;
+        }
+      }
+    }
+  }
+
+  if (!compute_local) {
+    return List::create(
+      Named("volume") = mask_volume,
+      Named("N") = static_cast<double>(N),
+      Named("usez") = usez,
+      Named("SSminus") = NumericVector::create(SSminus[0], SSminus[1], SSminus[2]),
+      Named("S2") = NumericVector::create(S2[0], S2[1], S2[2])
+    );
+  }
+
+  // Normalized within-mask Gaussian smoothing of sufficient statistics + empirical-Bayes shrinkage
+  smooth_3d_separable(vox_ss_x, nx, ny, nz, smooth_fwhm);
+  smooth_3d_separable(vox_s2_x, nx, ny, nz, smooth_fwhm);
+  smooth_3d_separable(vox_ss_y, nx, ny, nz, smooth_fwhm);
+  smooth_3d_separable(vox_s2_y, nx, ny, nz, smooth_fwhm);
+  if (usez) {
+    smooth_3d_separable(vox_ss_z, nx, ny, nz, smooth_fwhm);
+    smooth_3d_separable(vox_s2_z, nx, ny, nz, smooth_fwhm);
+  }
+
+  auto clamp_rho = [](double r) -> double {
+    return std::min(0.99999, std::max(1e-4, r));
+  };
+  double rho_glob_x = (S2[0] > 0.0) ? clamp_rho(std::fabs(SSminus[0] / S2[0])) : 0.5;
+  double rho_glob_y = (S2[1] > 0.0) ? clamp_rho(std::fabs(SSminus[1] / S2[1])) : 0.5;
+  double rho_glob_z = (usez && S2[2] > 0.0) ? clamp_rho(std::fabs(SSminus[2] / S2[2])) : 0.5;
+
+  double mean_s2_x = 0.0, mean_s2_y = 0.0, mean_s2_z = 0.0;
+  if (mask_volume > 0) {
+    for (int i = 0; i < n_vox; ++i) {
+      if (!active[i]) continue;
+      mean_s2_x += vox_s2_x[i];
+      mean_s2_y += vox_s2_y[i];
+      if (usez) mean_s2_z += vox_s2_z[i];
+    }
+    mean_s2_x /= mask_volume;
+    mean_s2_y /= mask_volume;
+    if (usez) mean_s2_z /= mask_volume;
+  }
+  double tau_x = 0.05 * std::max(1e-8, mean_s2_x);
+  double tau_y = 0.05 * std::max(1e-8, mean_s2_y);
+  double tau_z = 0.05 * std::max(1e-8, mean_s2_z);
+
+  NumericVector dlh_map(n_vox, 0.0);
+  NumericVector voxel_weights(n_vox, 0.0);
+  const double scale_dim = usez ? std::pow(8.0, -0.5) : std::pow(4.0, -0.5);
+  double sum_dlh = 0.0;
+
+  for (int i = 0; i < n_vox; ++i) {
+    if (!active[i]) continue;
+    double rx = clamp_rho((std::max(0.0, vox_ss_x[i]) + tau_x * rho_glob_x) / (vox_s2_x[i] + tau_x));
+    double ry = clamp_rho((std::max(0.0, vox_ss_y[i]) + tau_y * rho_glob_y) / (vox_s2_y[i] + tau_y));
+    double sx2 = -1.0 / (4.0 * std::log(rx));
+    double sy2 = -1.0 / (4.0 * std::log(ry));
+    double dlh_i;
+    if (usez) {
+      double rz = clamp_rho((std::max(0.0, vox_ss_z[i]) + tau_z * rho_glob_z) / (vox_s2_z[i] + tau_z));
+      double sz2 = -1.0 / (4.0 * std::log(rz));
+      dlh_i = std::pow(sx2 * sy2 * sz2, -0.5) * scale_dim * dof_correction;
+    } else {
+      dlh_i = std::pow(sx2 * sy2, -0.5) * scale_dim * dof_correction;
+    }
+    dlh_map[i] = dlh_i;
+    sum_dlh += dlh_i;
+  }
+
+  double mean_dlh = (mask_volume > 0 && sum_dlh > 0.0) ? (sum_dlh / mask_volume) : 1.0;
+  double sum_w = 0.0;
+  for (int i = 0; i < n_vox; ++i) {
+    if (active[i]) {
+      // Winsorize extreme local roughness ratios to [0.1, 10.0] for numerical stability
+      double w = std::min(10.0, std::max(0.1, dlh_map[i] / mean_dlh));
+      voxel_weights[i] = w;
+      sum_w += w;
+    } else if (in_mask[i]) {
+      // Fallback weight 1.0 for mask voxels that had zero temporal variance in 4D residuals
+      voxel_weights[i] = 1.0;
+    }
+  }
+  if (mask_volume > 0 && sum_w > 0.0) {
+    double norm_w = static_cast<double>(mask_volume) / sum_w;
+    for (int i = 0; i < n_vox; ++i) {
+      if (active[i]) {
+        voxel_weights[i] *= norm_w;
+      }
+    }
   }
 
   return List::create(
@@ -659,6 +1078,8 @@ List smoothest_cpp(NumericVector img, NumericVector mask,
     Named("N") = static_cast<double>(N),
     Named("usez") = usez,
     Named("SSminus") = NumericVector::create(SSminus[0], SSminus[1], SSminus[2]),
-    Named("S2") = NumericVector::create(S2[0], S2[1], S2[2])
+    Named("S2") = NumericVector::create(S2[0], S2[1], S2[2]),
+    Named("dLh_map") = dlh_map,
+    Named("voxel_weights") = voxel_weights
   );
 }

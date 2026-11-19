@@ -1,5 +1,11 @@
 # change.log
 
+v0.4.0 (Non-stationary smoothness adjustment)
+- Added optional non-stationary smoothness adjustment (`nonstationary = TRUE` in `ptfce()` and `smoothest()`, default `FALSE`) based on Worsley et al. (1999), Hayasaka et al. (2004), and Salimi-Khorshidi et al. (2011)
+- Extended `smoothest()` C++ engine with normalized within-mask separable 3D Gaussian smoothing (`smooth_fwhm = 3.0`) and empirical-Bayes shrinkage of voxelwise derivative sufficient statistics, outputting `dLh_map`, `rpv_map` (RESELs per voxel), and mean-1 `voxel_weights`
+- Extended `ptfce_tail_cpp()` with continuous resel-weighted cluster mass accumulation and fast 4-point cubic Lagrange log-space interpolation tables
+- Added `local_smoothness` parameter to `ptfce()` allowing reuse of precomputed `smoothest(..., nonstationary = TRUE)` objects or external RPV/roughness maps (e.g. SPM `RPV.nii`) across multiple contrasts
+
 v0.3.0 (Fork release)
 - Replaced connected-components loop (`mmand::components` + `table`) and nested `stats::integrate` calls with a C++ (`Rcpp`) single-pass descending Union-Find engine and log-space adaptive Gauss-Kronrod posterior quadrature (~100-500x faster, ~50x lower RAM, drops `mmand` dependency)
 - Eliminated numerical underflow/quadrature spike-miss bugs (`pvox.clust > 1`, cluster-border `NaN`s, silent score deflation inside large clusters, and artificial `745` / `Z = 37.53` ceiling)

@@ -21,7 +21,10 @@ ptfce(
   dh = 0.05,
   connectivity = 6L,
   fwe_p = 0.05,
-  legacy = FALSE
+  legacy = FALSE,
+  nonstationary = FALSE,
+  local_smoothness = NULL,
+  smooth_fwhm = 3
 )
 }
 \arguments{
@@ -77,6 +80,21 @@ two-sided FWER at \code{fwe_p}.}
 \item{legacy}{Logical; if \code{TRUE}, uses upstream \code{Nh}-point discrete summation
 from \code{logpmin} to \code{logpmax} instead of analytical sub-\code{ZestThr}
 integration with fixed \code{dh} (default: \code{FALSE}).}
+
+\item{nonstationary}{Logical; if \code{TRUE}, adjusts cluster sizes for spatial
+smoothness non-stationarity using normalized local roughness weights
+\code{w(v) = dLh(v) / mean(dLh)} (Worsley et al., 1999; Hayasaka et al., 2004;
+Salimi-Khorshidi et al., 2011). Default is \code{FALSE} (stationary cluster voxel counts).}
+
+\item{local_smoothness}{Optional precomputed local smoothness object for non-stationary
+adjustment: either a list returned by \code{smoothest(..., nonstationary = TRUE)},
+or a 2D/3D image / file path containing local \code{dLh}, \code{RPV} (e.g. SPM's
+\code{RPV.nii}), or positive voxel roughness weights. Supplying \code{local_smoothness}
+automatically enables \code{nonstationary = TRUE} unless explicitly set to \code{FALSE}.}
+
+\item{smooth_fwhm}{Numeric scalar; spatial Gaussian smoothing FWHM in voxels applied
+within the mask to regularize voxelwise derivative statistics when estimating
+non-stationary smoothness (default: \code{3.0}; Salimi-Khorshidi et al., 2011).}
 }
 \value{
 An object of class \code{"ptfce"} (a list) containing:
@@ -90,6 +108,8 @@ An object of class \code{"ptfce"} (a list) containing:
   \item \strong{fwe.Z}: Named numeric vector of GRF FWER Z-score thresholds corresponding
     to \code{fwe_p}.
   \item \strong{sided}: Enhancement sidedness used.
+  \item \strong{nonstationary}: Logical indicating whether non-stationary smoothness
+    adjustment was applied.
 }
 }
 \description{
@@ -114,14 +134,24 @@ excursion sets are enhanced independently on identical threshold grids:
   \item \code{$p} contains two-sided uncorrected enhanced p-values \code{2 * Phi(-abs(Z))}.
   \item \code{$logp} contains \code{-log(p)}.
 }
+
+When \code{nonstationary = TRUE} (ideally paired with 4D \code{residual} and \code{dof},
+or a precomputed \code{local_smoothness} map), each supra-threshold cluster's extent is
+measured in local resel-scaled voxel units \eqn{\tilde{c}(\mathcal{C}) = \sum_{v \in \mathcal{C}} w(v)}
+rather than raw voxel count. Smooth brain regions (\eqn{w(v) < 1}) are appropriately
+tempered against noise-blob inflation, while rougher regions (\eqn{w(v) > 1}, e.g.
+subcortex) gain sensitivity for compact true signals.
 }
 \examples{
 \dontrun{
 # Standard bi-sided fMRI enhancement using 4D residuals for smoothness:
 res <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
              residual = "res4d.nii.gz", dof = 42, sided = "two.sided")
-sig_map <- res$Z
-sig_map[abs(sig_map) < res$fwer0.05.Z] <- 0
+
+# With non-stationary smoothness adjustment from 4D residuals:
+res_ns <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
+                residual = "res4d.nii.gz", dof = 42,
+                sided = "two.sided", nonstationary = TRUE)
 }
 }
 \references{

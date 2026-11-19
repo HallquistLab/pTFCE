@@ -2,9 +2,16 @@
 % Please edit documentation in R/ptfce.r
 \name{smoothest}
 \alias{smoothest}
-\title{Estimate global image smoothness}
+\title{Estimate global (and optionally local non-stationary) image smoothness}
 \usage{
-smoothest(img, mask, dof = NA, verbose = TRUE)
+smoothest(
+  img,
+  mask,
+  dof = NA,
+  verbose = TRUE,
+  nonstationary = FALSE,
+  smooth_fwhm = 3
+)
 }
 \arguments{
 \item{img}{A 2D/3D Z-score image or 4D residual image (\code{RNifti}, \code{oro.nifti},
@@ -15,6 +22,14 @@ smoothest(img, mask, dof = NA, verbose = TRUE)
 \item{dof}{Residual degrees of freedom (required when \code{img} is a 4D residual image).}
 
 \item{verbose}{Logical; print diagnostic messages if \code{TRUE} (default).}
+
+\item{nonstationary}{Logical; if \code{TRUE}, also compute spatially regularized
+voxelwise \code{dLh_map}, \code{rpv_map} (RESELs per voxel), and mean-1 normalized
+\code{voxel_weights} inside the mask (default: \code{FALSE}).}
+
+\item{smooth_fwhm}{Spatial Gaussian smoothing FWHM in voxels applied within the mask
+to regularize voxelwise derivative sufficient statistics when \code{nonstationary = TRUE}
+(default: \code{3.0}).}
 }
 \value{
 A list containing:
@@ -24,9 +39,14 @@ A list containing:
   \item \strong{FWHM}: Full-width at half-maximum in x, y, z (voxels).
   \item \strong{dLh}: Determinant of \eqn{\Lambda^{1/2}} (\code{voxels^-3}).
   \item \strong{resels}: Resel size in voxels per resel.
+  \item \strong{dLh_map}, \strong{rpv_map}, \strong{voxel_weights}: Included when
+    \code{nonstationary = TRUE}, preserving the spatial image class of \code{mask}.
 }
 }
 \description{
 Fast C++ port of FSL's \code{smoothest} tool (Jenkinson, FMRIB Tech Report TR00DF1)
-supporting both 2D/3D Z-score maps and 4D GLM residual time-series images.
+supporting both 2D/3D Z-score maps and 4D GLM residual time-series images, with
+optional regularized voxelwise local roughness estimation (\code{dLh_map}, \code{rpv_map},
+and normalized \code{voxel_weights}) for non-stationary cluster inference
+(Worsley et al., 1999; Salimi-Khorshidi et al., 2011).
 }
