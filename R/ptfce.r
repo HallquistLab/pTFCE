@@ -195,7 +195,7 @@ ptfce <- function(img,
       stop("`local_smoothness` contains no positive finite values inside `mask`.", call. = FALSE)
     }
     m_raw <- mean(w_raw[pos])
-    w[pos] <- pmin(10.0, pmax(0.1, w_raw[pos] / m_raw))
+    w[pos] <- pmin(50.0, pmax(0.02, w_raw[pos] / m_raw))
     w[inside & !pos] <- 1.0
     w[inside] <- w[inside] / mean(w[inside])
     w
@@ -206,13 +206,18 @@ ptfce <- function(img,
   voxel_weights <- NULL
   smooth_computed <- NULL
 
-  # If a precomputed smoothest(..., nonstationary = TRUE) list was supplied, reuse its global parameters if needed
+  # If a precomputed smoothest(..., nonstationary = TRUE) list was supplied, reuse its parameters if needed
   if (is.list(local_smoothness) && all(c("volume", "dLh", "resels") %in% names(local_smoothness))) {
     if (is_missing_arg(Rd) || is_missing_arg(V)) {
       autosmooth <- TRUE
       V <- as.numeric(local_smoothness$volume)[1L]
-      Rd <- as.numeric(local_smoothness$dLh)[1L] * V
-      resels <- as.numeric(local_smoothness$resels)[1L]
+      if (nonstationary && !is.null(local_smoothness$dLh_nonstationary)) {
+        Rd <- as.numeric(local_smoothness$dLh_nonstationary)[1L] * V
+        resels <- as.numeric(local_smoothness$resels_nonstationary)[1L]
+      } else {
+        Rd <- as.numeric(local_smoothness$dLh)[1L] * V
+        resels <- as.numeric(local_smoothness$resels)[1L]
+      }
     }
   }
 
@@ -245,8 +250,13 @@ ptfce <- function(img,
       )
     }
     V <- smooth_computed$volume
-    Rd <- smooth_computed$dLh * V
-    resels <- smooth_computed$resels
+    if (nonstationary && !is.null(smooth_computed$dLh_nonstationary)) {
+      Rd <- smooth_computed$dLh_nonstationary * V
+      resels <- smooth_computed$resels_nonstationary
+    } else {
+      Rd <- smooth_computed$dLh * V
+      resels <- smooth_computed$resels
+    }
   } else {
     V <- as.numeric(V)[1L]
     Rd <- as.numeric(Rd)[1L]
@@ -764,6 +774,9 @@ smoothest <- function(img, mask, dof = NA, verbose = TRUE,
 
   if (nonstationary) {
     rpv_scale <- (4.0 * log(2.0))^(if (usez) 1.5 else 1.0)
+    dlh_ns <- sum(cpp_res$dLh_map) / cpp_res$volume
+    out$dLh_nonstationary <- unname(dlh_ns)
+    out$resels_nonstationary <- unname(rpv_scale / dlh_ns)
     out$dLh_map <- wrap_volume_output(cpp_res$dLh_map, mask_meta)
     out$rpv_map <- wrap_volume_output(cpp_res$dLh_map / rpv_scale, mask_meta)
     out$voxel_weights <- wrap_volume_output(cpp_res$voxel_weights, mask_meta)

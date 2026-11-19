@@ -1055,8 +1055,8 @@ List smoothest_cpp(NumericVector img, NumericVector mask,
   double sum_w = 0.0;
   for (int i = 0; i < n_vox; ++i) {
     if (active[i]) {
-      // Winsorize extreme local roughness ratios to [0.1, 10.0] for numerical stability
-      double w = std::min(10.0, std::max(0.1, dlh_map[i] / mean_dlh));
+      // Winsorize extreme local roughness ratios to [0.02, 50.0] for numerical stability
+      double w = std::min(50.0, std::max(0.02, dlh_map[i] / mean_dlh));
       voxel_weights[i] = w;
       sum_w += w;
     } else if (in_mask[i]) {

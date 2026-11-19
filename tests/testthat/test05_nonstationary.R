@@ -123,8 +123,10 @@ test_that("Non-stationary 4D residual smoothness boosts rough-region clusters an
   expect_true(out_pre_list$nonstationary)
   expect_equal(out_pre_list$Z, out_ns$Z, tolerance = 1e-12)
 
-  out_pre_rpv <- ptfce(z_img, mask, V = sm_ns$volume, Rd = sm_ns$dLh * sm_ns$volume,
-                       resels = sm_ns$resels, local_smoothness = sm_ns$rpv_map,
+  out_pre_rpv <- ptfce(z_img, mask, V = sm_ns$volume,
+                       Rd = sm_ns$dLh_nonstationary * sm_ns$volume,
+                       resels = sm_ns$resels_nonstationary,
+                       local_smoothness = sm_ns$rpv_map,
                        sided = "two.sided", verbose = FALSE)
   expect_equal(out_pre_rpv$Z, out_ns$Z, tolerance = 1e-6)
 
