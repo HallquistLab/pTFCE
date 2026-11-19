@@ -2,31 +2,19 @@
 % Please edit documentation in R/ptfce.r
 \name{fwe.z2p}
 \alias{fwe.z2p}
-\title{Convert Z-score value to FWER corrected p-value}
+\title{Convert Z-score value(s) to GRF FWER-corrected p-value(s)}
 \usage{
 fwe.z2p(resel_count, Z)
 }
 \arguments{
-\item{resel_count}{resel count}
+\item{resel_count}{Number of resels in the search volume (\code{volume / resels}).}
 
-\item{Z}{z-score value}
+\item{Z}{Numeric vector of Z-score values.}
 }
 \value{
-FWER-corrected p-value
+Numeric vector of FWER-corrected p-values in \code{[0, 1]}.
 }
 \description{
-https://github.com/spisakt/pTFCE
-}
-\details{
-The Z-score value is converted to to p-value, corrected for multiple comparisons by controlling for famili-wise error rate
-The parameter resel_count is the number of resels (resolution elements) in the image, and can be obtained e.g by smoothest() (see examples).
-}
-\examples{
-\dontrun{
-s=smoothest(zmap, mask)
-fwe.z2p(resel_count=s$volume/s$resels, Z=2.3)
-
-pTFCE=ptfe(zmap, mask)
-fwe.z2p(pTFCE$number_of_resels, Z=3.1)
-}
+Uses the 3D Gaussian Random Field Expected Euler Characteristic approximation.
+Vectorized over \code{Z} and \code{resel_count}.
 }

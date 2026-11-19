@@ -2,31 +2,20 @@
 % Please edit documentation in R/ptfce.r
 \name{fwe.p2z}
 \alias{fwe.p2z}
-\title{Get Z-score threshold for an FWER corrected p-value}
+\title{Compute GRF FWER-corrected Z-score threshold(s) from p-value(s)}
 \usage{
 fwe.p2z(resel_count, FWEP = 0.05)
 }
 \arguments{
-\item{resel_count}{resel count}
+\item{resel_count}{Number of resels in the search volume (\code{volume / resels}).}
 
-\item{FWEP}{FWER corrected p-value}
+\item{FWEP}{Numeric vector of target FWER-corrected p-values (default: \code{0.05}).}
 }
 \value{
-Z-score threshold
+Numeric vector of Z-score thresholds.
 }
 \description{
-https://github.com/spisakt/pTFCE
-}
-\details{
-The p-value, corrected for multiple comparisons by controlling for family-wise error rate, is converted to a Z-score threshold.
-The parameter resel_count is the number of resels (resolution elements) in the image, and can be obtained e.g by smoothest() (see examples).
-}
-\examples{
-\dontrun{
-s=smoothest(zmap, mask)
-fwe.p2z(resel_count=s$volume/s$resels, FWEP=0.05)
-
-pTFCE=ptfe(zmap, mask)
-fwe.p2z(pTFCE$number_of_resels, FWEP=0.05)
-}
+Uses Newton-Raphson in log-space to invert the 3D Expected Euler Characteristic
+FWER approximation accurately across arbitrary \code{FWEP} and \code{resel_count}.
+Vectorized over \code{FWEP} and \code{resel_count}.
 }

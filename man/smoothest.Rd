@@ -2,58 +2,31 @@
 % Please edit documentation in R/ptfce.r
 \name{smoothest}
 \alias{smoothest}
-\title{Estimate global image smoothness.}
+\title{Estimate global image smoothness}
 \usage{
-smoothest(img, mask, dof = NA, verbose = T)
+smoothest(img, mask, dof = NA, verbose = TRUE)
 }
 \arguments{
-\item{img}{Z-score image or a 4D residual image, ("nifti" class from
-"oro.nifti" package)}
+\item{img}{A 2D/3D Z-score image or 4D residual image (\code{RNifti}, \code{oro.nifti},
+\code{array}, or file path).}
 
-\item{mask}{image mask ("nifti" class from "oro.nifti" package)}
+\item{mask}{Spatial mask image (\code{RNifti}, \code{oro.nifti}, \code{array}, or file path).}
 
-\item{dof}{degrees of freedom, obligatory if img is a 4D residual image}
+\item{dof}{Residual degrees of freedom (required when \code{img} is a 4D residual image).}
 
-\item{verbose}{boolean: print progress bar and diagnostic messages if true
-(default)}
+\item{verbose}{Logical; print diagnostic messages if \code{TRUE} (default).}
 }
 \value{
-An object of class "smoothness" is a list containing at least the
-  following components:
-  \itemize{
-  \item \strong{volume}   volume of the mask used for estimating smoothness, in voxels
-
-  \item \strong{sigmasq}  sigma squared values in the x, y and z directions
-
-  \item \strong{FWHM}     full width at half maximum values of smoothness in the x, y and z
-  direction (voxels)
-
-  \item \strong{dLh}      determininant of Lambda to the half (voxels^-3)
-
-  \item \strong{resels}   resel size (voxels per resel) }
+A list containing:
+\itemize{
+  \item \strong{volume}: Mask volume in voxels.
+  \item \strong{sigmasq}: Estimated Gaussian smoothness variance in x, y, z (voxels^2).
+  \item \strong{FWHM}: Full-width at half-maximum in x, y, z (voxels).
+  \item \strong{dLh}: Determinant of \eqn{\Lambda^{1/2}} (\code{voxels^-3}).
+  \item \strong{resels}: Resel size in voxels per resel.
+}
 }
 \description{
-Ported form the C++ implementation of FSL.
-}
-\details{
-For mathematical background, see:
-https://www.fmrib.ox.ac.uk/datasets/techrep/tr00df1/tr00df1/index.html
-
-The function takes two images (both "nifti" object of the oro.nifti
-  package): (i) either a Z-score image or a 4D residual image together with
-  the degrees of freedom, and (ii) a mask image as obligatory inputs. Mask
-  can be either binary or continous, in the latter case it will be
-  thresholded at 0.5.
-
-  For a Gaussian random field the smoothness is defined as  \deqn{W
-  =|\Lambda|^{-1/2D} } where D is the dimensionality of the field and
-  \eqn{\Lambda} the covariance matrix of it's first partial derivatives.
-
-  Using Z-score image is less optimal because:
-\itemize{
-\item Smoothness estimates need spatial derivatives, which are very noisy
-  quantities and, for a single 3D map, can be computed just once on each
-  direction.
-\item The z-map may contain effects, and these affect smoothness.
-}
+Fast C++ port of FSL's \code{smoothest} tool (Jenkinson, FMRIB Tech Report TR00DF1)
+supporting both 2D/3D Z-score maps and 4D GLM residual time-series images.
 }

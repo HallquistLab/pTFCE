@@ -1,0 +1,307 @@
+---
+title: "Technical Report: Statistical, Numerical, and Algorithmic Modifications in the HallquistLab/pTFCE Fork"
+subtitle: "Tracking Departures from Upstream spisakt/pTFCE (v0.2.2.1)"
+author: "Hallquist Lab"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    code-fold: false
+    embed-resources: true
+    theme: cosmo
+execute:
+  echo: true
+  warning: false
+  message: false
+---
+
+## Overview & Motivation
+
+**Probabilistic Threshold-Free Cluster Enhancement (`pTFCE`)**, introduced by Spisák et al. (2019, *NeuroImage*, 185, 12–26), integrates multi-threshold cluster-extent information into voxelwise neuroimaging inference via Bayes' rule and Gaussian Random Field (GRF) theory. Unlike standard TFCE (Smith & Nichols, 2009), `pTFCE` outputs calibrated probabilities and $Z$-scores directly without requiring computationally expensive permutation testing.
+
+While applying `pTFCE` extensively to group-level fMRI analyses—particularly **bi-sided (two-tailed) contrasts** where both positive activations and negative deactivations are of scientific interest—we identified several interacting mathematical, numerical, and software issues in upstream `spisakt/pTFCE` (`v0.2.2.1`, commit `6fd6be5`):
+
+1. **Cross-tail and cross-cluster threshold grid interference:** Fixing the threshold count `Nh = 100` across `[0, logpmax]` causes the integration step size $\Delta h \propto \frac{1}{2}Z_{\max}^2$ to depend on the global maximum $Z$-score in each tail. Strong focal peaks in one tail coarsen $\Delta h$ by 15–35$\times$ relative to a moderate opposite tail, shifting enhanced $Z$-scores of unrelated clusters across the FWER significance boundary and crashing with `Inf` when $Z_{\max} > 37.5$.
+2. **Catastrophic nested quadrature failures (`p > 1`, cluster-border `NaN`s, and silent interior score deflation):** Evaluating the Bayes normalization integral via `stats::integrate(..., -Inf, Inf)` inside `pvox.clust()` misses narrow posterior spikes near $Z_{\text{estThr}} = 1.3$ when smoothness is low/moderate ($R_d$ large) and cluster size $c$ is large, returning "probabilities" $> 1$ (up to $10^{19}$), producing `NaN`s on cluster borders (upstream Issues #8, #10, #25) and *silently* deflating interior cluster $Z$-scores.
+3. **A ~20% zero "dead zone" around $Z = 0$ and `-8.2095` background floor:** Discrete left-endpoint summation below `ZestThr` maps small positive $|Z|$ values to $p > 0.5$ ($Z_{\text{pTFCE}} < 0$), collapsing ~20% of in-mask voxels to `0` under standard two-pass clamping and mapping out-of-mask/opposite-tail voxels to `-8.209536` (Issues #11, #16, #24).
+4. **Unmasked connected-component leakage & R $\ge$ 4.2 incompatibilities:** `mmand::components()` ran prior to masking (allowing clusters and `max(img)` to bleed outside ROI masks), `if (!is.na(residual))` threw a fatal error on R $\ge$ 4.2 for 4D residual arrays, `interpolate()` returned `NaN` (`0/0`) at exact DOF lookup knots and used an inverted linear interpolation endpoint, and pure-R loops required ~2.5–5 minutes and 1.5–4 GB of RAM per whole-brain bi-sided contrast.
+
+This document records **all statistical, numerical, algorithmic, and API departures** introduced in `HallquistLab/pTFCE` (`v0.3.0+`) relative to upstream `spisakt/pTFCE` (`v0.2.2.1`), alongside executable demonstrations.
+
+---
+
+## Summary Table of Departures from Upstream (`v0.2.2.1`)
+
+| Component | Upstream `spisakt/pTFCE` (`v0.2.2.1`) | `HallquistLab/pTFCE` (`v0.3.0`) | Backward Compatibility |
+| :--- | :--- | :--- | :--- |
+| **Sidedness** | Positive tail only (`Z > 0`); negative tail requires manual two-pass wrapper | Native `sided = c("positive", "two.sided", "negative")`; `"positive"` default | 100% drop-in compatible; `sided = "two.sided"` opt-in |
+| **Threshold grid & sub-`ZestThr` integration** | `Nh = 100` equidistant points on `[0, logpmax]`; step `dh` scales with $Z_{\max}^2$ | Analytical integration on $[0, x_{\text{ZestThr}}]$ + fixed `dh = 0.05` midpoint grid above `ZestThr` | Pass `Nh = 100` (or `legacy = TRUE`) to use legacy discrete grid |
+| **Sub-threshold & out-of-mask values** | Out-of-mask and $Z \le 0$ map to $Z = -8.2095$; ~20% dead zone near $Z = 0$ in 2-sided clamping | Exact identity $\tilde{Z}_v = Z_v$ for $|Z_v| \le Z_{\text{estThr}}$; out-of-mask `Z = 0`, `logp = 0`, `p = 1` | Legacy floor retained inside mask only when `legacy = TRUE` / `Nh` set |
+| **Posterior quadrature `pvox.clust()`** | Nested `stats::integrate` over `(-Inf, Inf)` with `CONST = 10^40` and `745` cap | Mode-shifted log-space adaptive 15-pt Gauss-Kronrod + Laplace continued fraction + `log1p` near `ZestThr` | Matches upstream to $< 10^{-5}$ where upstream did not underflow |
+| **Connected components & RAM** | 100 passes of `mmand::components` + `table()`; allocates two 4D arrays (~1.5–4 GB) | Single-pass C++ descending Union-Find (`Rcpp`) on in-mask voxels $> Z_{\text{estThr}}$ (~20 MB RAM); drops `mmand` | Identical 6-connectivity default; adds `connectivity = c(6, 18, 26)` |
+| **Pre-masking & `NA`/`Inf` checks** | Applied mask *after* `components()` and `max(img)`; warned on out-of-mask SPM `NaN`s | Masks `img` *before* `max()` and connected components; warns only on in-mask `NA`/`Inf` | Strictly safer for ROI / small-volume masks |
+| **Smoothness (`smoothest()`)** | Pure R triple loop; `if (!is.na(residual))` crashes on R $\ge$ 4.2; `dim[4]==1` crashes `aperm`; `interpolate()` `0/0` bug | Zero-copy 3-pass C++ `smoothest_cpp`; R $\ge$ 4.2 safe; `dim[4]==1` handled; fixed `stats::approx` DOF LUT | Identical FSL `smoothest` formulas at corrected DOF knots |
+| **FWER helpers (`fwe.p2z`, `fwe.z2p`)** | Non-vectorized; bisection stops at `0.001`; `exp(-0.5*z^2)` underflows at $z > 38.5$ | Vectorized; log-space Newton-Raphson accurate to $10^{-13}$ up to $z > 38$ | ~`2e-4` refinement over coarse `0.001` bisection |
+| **Image I/O & `t2z()`** | Requires `oro.nifti` S4 objects; fails on plain arrays | Supports `RNifti`, `oro.nifti` (in `Suggests`), plain `array`s, and NIfTI paths; adds log-space `t2z(img, dof)` | Returns same image class as input (`oro.nifti` -> `oro.nifti`) |
+
+---
+
+## Bi-Sided (`+Z` and `-Z`) Improvements
+
+```{r setup}
+library(pTFCE)
+library(RNifti)
+library(ggplot2)
+```
+
+### Eliminating Non-Local `Z_max` Interference & Tail Asymmetry
+
+In upstream `pTFCE`, `Nh = 100` thresholds are spaced evenly from `0` to $\text{logpmax} = -\log\Phi(-Z_{\max}) \approx \frac{1}{2}Z_{\max}^2$. Whenever one tail contains a strong focal peak (e.g., $Z_{\max}^+ = 25$ in visual or motor cortex, giving $\Delta h^+ \approx 3.20$) while the opposite tail has moderate peaks ($Z_{\max}^- = 4.5$, giving $\Delta h^- \approx 0.13$), the two tails use vastly different integration step sizes, and moderate clusters in the strong-peak tail lose most of their cluster-forming thresholds. Furthermore, upstream `pnorm(max(img), lower.tail = FALSE)` underflowed to `0` at $Z_{\max} > 37.5$, crashing `seq()` with `'to' must be a finite number`.
+
+In `HallquistLab/pTFCE`, the Continuous + Fixed-`dh` default (`dh = 0.05`, `legacy = FALSE`) uses a fixed $-\log p$ step size independent of $Z_{\max}$ up to $-\log p = 100$ ($Z \approx 14$), with bounded adaptive panels above $-\log p = 100$:
+
+```{r peak-invariance-demo, fig.width=7.5, fig.height=4.2}
+d <- c(24L, 24L, 24L)
+mask <- array(1, dim = d)
+base_img <- array(0, dim = d)
+# Fixed target cluster in region A: 5x5x5 cube of Z = 3.6 with center 3.9
+base_img[3:7, 3:7, 3:7] <- 3.6
+base_img[5, 5, 5] <- 3.9
+
+distant_peaks <- c(3.9, 6, 10, 15, 20, 25, 30, 36, 45)
+records <- lapply(distant_peaks, function(z_dist) {
+  img <- base_img
+  img[20:21, 20:21, 20:21] <- min(z_dist, 15)
+  img[20, 20, 20] <- z_dist
+
+  # Fork default: fixed dh = 0.05 + analytical sub-ZestThr
+  z_fixed <- ptfce(img, mask, V = prod(d), Rd = 1500, resels = 50,
+                   sided = "positive", dh = 0.05, verbose = FALSE)$Z[5, 5, 5]
+
+  # Legacy grid: fixed Nh = 100 (using log-space pnorm so Z = 45 doesn't crash)
+  z_legacy <- ptfce(img, mask, V = prod(d), Rd = 1500, resels = 50,
+                    sided = "positive", Nh = 100, legacy = TRUE, verbose = FALSE)$Z[5, 5, 5]
+
+  data.frame(
+    distant_Z_max = z_dist,
+    `Fork default (dh = 0.05)` = z_fixed,
+    `Legacy grid (Nh = 100)` = z_legacy,
+    check.names = FALSE
+  )
+})
+df_peak <- do.call(rbind, records)
+df_long <- reshape(
+  df_peak,
+  varying = c("Fork default (dh = 0.05)", "Legacy grid (Nh = 100)"),
+  v.names = "enhanced_Z",
+  timevar = "Method",
+  times = c("Fork default (dh = 0.05)", "Legacy grid (Nh = 100)"),
+  direction = "long"
+)
+
+ggplot(df_long, aes(x = distant_Z_max, y = enhanced_Z, color = Method, shape = Method)) +
+  geom_hline(yintercept = fwe.p2z(prod(d) / 50, 0.05), linetype = "dashed", color = "grey40") +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 2.4) +
+  annotate("text", x = 36, y = fwe.p2z(prod(d) / 50, 0.05) + 0.08,
+           label = "FWER p < 0.05 threshold", size = 3.3, color = "grey30") +
+  labs(
+    title = "Sensitivity of a Fixed Cluster (Peak Z = 3.9) to an Unrelated Distant Peak",
+    x = "Distant Peak Z_max Elsewhere in Brain",
+    y = "Enhanced pTFCE Z at Target Cluster [5,5,5]"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "bottom")
+```
+
+### Analytical Sub-`ZestThr` Integration & Removal of the Zero Dead-Zone
+
+In the continuous limit $\Delta h \to 0$, Spisák et al.'s equidistant logarithmic probability aggregation converges to:
+$$-\log p_{\text{pTFCE}}(v) = \sqrt{2 \int_0^{x_v} \left(-\log P\big(H > h(x) \mid C = c_v(h(x))\big)\right) dx}, \qquad x_v = -\log\Phi(-|Z_v|)$$
+Because GRF cluster theory does not apply below `ZestThr = 1.3` ($x_{\text{ZestThr}} = -\log\Phi(-1.3) \approx 2.3351$), $P(H > h(x) \mid C)$ equals the unenhanced tail probability $e^{-x}$ for all $x \le x_{\text{ZestThr}}$. Thus the sub-threshold integral is **analytically exact**:
+$$\int_0^{\min(x_v, x_{\text{ZestThr}})} x\,dx = \frac{1}{2}\min(x_v, x_{\text{ZestThr}})^2$$
+
+Evaluating this lower segment analytically ensures $\tilde{Z}_v = Z_v$ *identically* for all $|Z_v| \le 1.3$, eliminating both unnecessary connected-component sweeps below $Z = 1.3$ and the ~20% zero dead-zone around $Z = 0$ seen when clamping two legacy one-sided runs:
+
+```{r deadzone-demo, fig.width=7.5, fig.height=4.2}
+z_path <- system.file("extdata", "test03B_zstat1.nii.gz", package = "pTFCE")
+m_path <- system.file("extdata", "test03B_mask.nii.gz", package = "pTFCE")
+z_nii <- readNifti(z_path)
+m_nii <- readNifti(m_path)
+inside <- as.array(m_nii) > 0.5
+z_raw <- as.array(z_nii)[inside]
+
+sm <- smoothest(z_nii, m_nii, verbose = FALSE)
+V <- sm$volume
+Rd <- sm$dLh * V
+
+# 1. Native bi-sided (fork default)
+bi_modern <- ptfce(z_nii, m_nii, Rd = Rd, V = V, resels = sm$resels,
+                   sided = "two.sided", verbose = FALSE)
+z_modern <- as.array(bi_modern$Z)[inside]
+
+# 2. Legacy two-pass wrapper behavior (Nh = 100 per tail, clamp Z < 0 to 0)
+pos_leg <- ptfce(z_nii, m_nii, Rd = Rd, V = V, resels = sm$resels,
+                 Nh = 100, legacy = TRUE, verbose = FALSE)
+neg_leg <- ptfce(-as.array(z_nii), as.array(m_nii), Rd = Rd, V = V, resels = sm$resels,
+                 Nh = 100, legacy = TRUE, verbose = FALSE)
+z_leg_bi <- pmax(as.array(pos_leg$Z)[inside], 0) - pmax(as.array(neg_leg$Z)[inside], 0)
+
+cat(sprintf("In-mask voxels equal to exact 0:\n  Raw Z-map:        %.2f%%\n  Legacy 2-pass:    %.2f%%\n  Fork two.sided:   %.2f%%\n",
+            100 * mean(z_raw == 0), 100 * mean(z_leg_bi == 0), 100 * mean(z_modern == 0)))
+
+set.seed(1)
+samp <- sample(which(abs(z_raw) < 3.5), 4000)
+df_map <- rbind(
+  data.frame(raw_Z = z_raw[samp], enh_Z = z_leg_bi[samp], Mode = "Legacy 2-pass (Nh = 100 + zero clamp)"),
+  data.frame(raw_Z = z_raw[samp], enh_Z = z_modern[samp], Mode = "Fork native sided = 'two.sided' (dh = 0.05)")
+)
+
+ggplot(df_map, aes(x = raw_Z, y = enh_Z, color = Mode)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dotted", color = "black") +
+  geom_point(alpha = 0.25, size = 0.7) +
+  facet_wrap(~ Mode) +
+  labs(
+    title = "Input vs. Enhanced Z-Scores Across [-3.5, 3.5] on Whole-Brain fMRI Z-Map",
+    x = "Original Input Z",
+    y = "Enhanced Bi-Sided pTFCE Z"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(legend.position = "none")
+```
+
+### Bi-Sided Return Conventions
+
+When `sided = "two.sided"`:
+
+- **`$Z`:** Signed enhanced $Z$-scores (`> 0` where input $Z > 0$, `< 0` where input $Z < 0$, `0` outside mask), satisfying strict contrast anti-symmetry `ptfce(-Z, mask, sided = "two.sided")$Z == -ptfce(Z, mask, sided = "two.sided")$Z`.
+- **`$p` and `$logp`:** Two-sided uncorrected enhanced $p$-values $p_{\text{2s}} = \min(1, 2 p_{\text{1s}}) = 2\Phi(-|\tilde{Z}|)$ and $-\log p_{\text{2s}}$.
+- **`$fwer0.05.Z` and `$fwe.Z`:** Two-sided GRF FWER thresholds computed at $\alpha / 2$ per tail (`fwe.p2z(number_of_resels, fwe_p / 2)`), so thresholding at `abs(res$Z) >= res$fwer0.05.Z` controls two-sided family-wise error rate at $\alpha = 0.05$.
+
+---
+
+## Numerical Stability: Log-Space Posterior Quadrature
+
+### Diagnosis of Upstream `NaN` and Underflow Bugs
+
+Upstream `pTFCE` computed $P(H > \text{actH} \mid C = c, H \ge Z_{\text{estThr}})$ via two nested calls to `stats::integrate`:
+
+```r
+# Upstream R/ptfce.r (v0.2.2.1):
+dvox.clust <- function(h, V, Rd, c, ZestThr = 1.3) {
+  dvox(h) * dclust(h, V, Rd, c, ZestThr) /
+    stats::integrate(function(x) dvox(x) * dclust(x, V, Rd, c, ZestThr), -Inf, Inf)$value
+}
+pvox.clust <- function(V, Rd, c, actH, ZestThr = 1.3) {
+  stats::integrate(function(x) dvox.clust(x, V, Rd, c, ZestThr = ZestThr), actH, Inf)$value
+}
+```
+
+When image smoothness is low/moderate ($R_d = V \cdot \text{dLh}$ large) and a cluster at low thresholds is large ($c$ large), the unnormalized density $f(x) = \phi(x)\lambda(x)\exp(-\lambda(x)c^{2/3})$ concentrates in a very narrow spike just above $x = 1.3$. Mapping `(-Inf, Inf)` via QUADPACK's transformation missed most of that spike in the denominator while `integrate(..., actH, Inf)` captured it in the numerator—producing `pvox.clust > 1` (e.g., $1.01 \times 10^{19}$ at $V = 300\text{k}, R_d = 100\text{k}, c = 20\text{k}, h = 1.31$, i.e. $-\log p = -43.76$). Border voxels with no higher-threshold contributions then yielded $8s + \Delta h < 0 \implies \texttt{NaN}$ inside `sqrt()`, while interior cluster voxels had `43.76` *silently subtracted* from their $-\log p$ sum without triggering a warning.
+
+### Strict Concavity & Mode-Shifted Gauss-Kronrod Solution
+
+In `src/ptfce_core.cpp`, we work entirely with the log-unnormalized posterior on $(1.1, \infty)$:
+$$\ell(h) = -\frac{1}{2}\log(2\pi) - \frac{h^2}{2} + \log\lambda(h) - c^{2/3}\lambda(h)$$
+
+1. **Analytical cancellation in Mill's ratio:** For $h \ge 12$, $\log\Phi(-h) + \frac{1}{2}h^2$ is evaluated via a 32-term Laplace continued fraction, avoiding IEEE double underflow of $\Phi(-h)$ for $h > 38$ and avoiding $\frac{1}{2}h^2 - \frac{1}{2}h^2$ cancellation.
+2. **Guaranteed unimodality:** All three terms of $\ell(h)$ have strictly negative second derivative ($\ell''(h) < 0$) on $(1.1, \infty)$. Thus $\ell(h)$ has a unique global maximum $m^* \ge a$ on any $[a, \infty)$, found via derivative sign check at $a$ plus golden-section search, and decays monotonically past $m^*$ to $b$ where $\ell(b) = \ell(m^*) - 50$ ($e^{-50} \approx 1.9 \times 10^{-22}$).
+3. **Adaptive 15-point Gauss-Kronrod + `log1p` near `ZestThr`:** Integrating $\exp(\ell(x) - \ell(m^*)) \in [0, 1]$ on $[a, m^*]$ and $[m^*, b]$ achieves $< 10^{-12}$ relative accuracy, caches $\log I_{\text{den}}(c)$ once per unique integer cluster size $c$, and switches to $\text{log1p}(I_{\text{left}} / I_{\text{num}})$ whenever $\log I_{\text{den}} - \log I_{\text{num}} < 0.05$, guaranteeing $0 < p \le 1$ strictly:
+
+```{r quadrature-table}
+cases <- expand.grid(
+  Rd = c(2000, 50000, 100000),
+  c_size = c(500, 20000),
+  h = c(1.31, 4.50)
+)
+cases$neglog_p <- mapply(
+  function(rd, cs, hh) pTFCE:::neglog_pvox_clust_cpp(300000, rd, cs, hh, 1.3),
+  cases$Rd, cases$c_size, cases$h
+)
+cases$p_val <- exp(-cases$neglog_p)
+knitr::kable(cases, digits = 5,
+             caption = "Exact log-space posterior -log(p) across regimes where upstream v0.2.2.1 overflowed (p > 1 -> NaN) or underflowed (capped at 745).")
+```
+
+---
+
+## Masking, Smoothness, & Bug Fixes
+
+1. **Strict pre-masking & SPM `NaN` hygiene:** `ptfce()` now thresholds `inside = mask > 0.5` and zeros `img[!inside] <- 0` *before* checking for `NA`/`Inf`, computing `z_peak`, or running connected components. Out-of-mask `NaN`s (standard in SPM `spmT` images) no longer trigger false warnings, and supra-threshold features outside an ROI mask can never merge with in-mask voxels.
+2. **Smoothness estimation on bi-sided maps & 4D residuals:**
+   - Fixed `if (!is.na(residual))` so passing a 4D `residual` image directly to `ptfce()` works on R $\ge$ 4.2.
+   - Fixed 3D images stored with 4th dimension `1` (`dim = c(nx, ny, nz, 1)`) so `smoothest()` treats them as 3D rather than crashing in `aperm()` (upstream Issue #19).
+   - Fixed `interpolate(v)` in `smoothest()`, which previously divided `0 / 0 = NaN` whenever `dof` equaled an exact lookup knot (`5..20, 25, 30, 40, 50, ...`) and added `+ j.second` instead of `+ i.second` during linear interpolation.
+   - Note on Z-map smoothness: when 4D residuals are unavailable, smoothness is always estimated on the **full unrectified signed $Z$-map** inside the mask. Zeroing negative voxels prior to `smoothest()` severely biases resel estimates (e.g., `467.2` vs `693.4` resels on `test03B_zstat1.nii.gz`, a 33% bias).
+3. **Exact vectorized `fwe.p2z()` and `fwe.z2p()`:** Replaced scalar `0.001`-tolerance bisection with vectorized log-space Newton-Raphson inversion (`1e-13` relative tolerance), maintaining exact mutual inversion (`fwe.z2p(r, fwe.p2z(r, alpha)) == alpha`) even for extreme $\alpha < 10^{-100}$.
+
+---
+
+## Algorithmic Architecture (`Rcpp`) & Benchmarks
+
+Upstream `pTFCE` executed `Nh = 100` full-volume 3D connected-component labeling sweeps (`mmand::components`) plus string-based frequency tables (`base::table(ccc)`) and allocated two 4D arrays (`dim(img) x Nh`).
+
+In `src/ptfce_core.cpp`:
+
+- **`ptfce_tail_cpp()`:** Collects only in-mask voxels with $Z > Z_{\text{estThr}}$ (~5–15% of total bounding-box voxels), sorts them once in descending order of intensity, and sweeps thresholds from high to low using a Disjoint-Set Union (Union-Find) structure with path compression and union-by-size. Voxel insertions and neighbor unions occur **at most once per supra-threshold voxel across the entire run**, making connected-component cost nearly independent of threshold density.
+- **`smoothest_cpp()`:** Performs three sequential, cache-contiguous passes over 4D `res4d` volumes without duplicating the 4D array in memory.
+
+```{r benchmark}
+r4d_path <- system.file("extdata", "test03A_res4d.nii.gz", package = "pTFCE")
+m3a_path <- system.file("extdata", "test03A_mask.nii.gz", package = "pTFCE")
+r4d <- readNifti(r4d_path)
+m3a <- readNifti(m3a_path)
+
+t_sm3d <- system.time(sm3 <- smoothest(z_nii, m_nii, verbose = FALSE))["elapsed"]
+t_sm4d <- system.time(sm4 <- smoothest(r4d, m3a, dof = 22, verbose = FALSE))["elapsed"]
+t_1s   <- system.time(ptfce(z_nii, m_nii, Rd = Rd, V = V, resels = sm3$resels,
+                            Nh = 100, legacy = TRUE, verbose = FALSE))["elapsed"]
+t_2s   <- system.time(ptfce(z_nii, m_nii, Rd = Rd, V = V, resels = sm3$resels,
+                            sided = "two.sided", dh = 0.05, verbose = FALSE))["elapsed"]
+
+bench_df <- data.frame(
+  Operation = c(
+    "3D smoothest() (301,461 mask voxels)",
+    "4D smoothest() (301,461 mask voxels x 25 volumes)",
+    "1-sided ptfce() (legacy Nh = 100)",
+    "Bi-sided ptfce() (sided = 'two.sided', dh = 0.05)"
+  ),
+  `Elapsed_Seconds` = c(t_sm3d, t_sm4d, t_1s, t_2s)
+)
+knitr::kable(bench_df, digits = 4, caption = "Wall-clock execution times on whole-brain test volumes.")
+```
+
+---
+
+## Usage & Migration Notes
+
+### Recommended Bi-Sided fMRI Workflow
+
+```r
+library(pTFCE)
+
+# Accepts file paths, RNifti objects, oro.nifti objects, or 3D arrays directly:
+res <- ptfce(
+  img = "zstat1.nii.gz",
+  mask = "mask.nii.gz",
+  residual = "res4d.nii.gz",
+  dof = 42,
+  sided = "two.sided",
+  dh = 0.05,
+  connectivity = 6L,     # 6 (NN=1), 18 (NN=2), or 26 (NN=3)
+  fwe_p = c(0.05, 0.01)
+)
+
+# If starting from a t-statistic map instead of a Z-map:
+z_img <- t2z("spmT_0001.nii.gz", dof = 42)
+res_t <- ptfce(z_img, mask = "mask.nii.gz", Rd = ..., V = ..., resels = ..., sided = "two.sided")
+```
+
+### Known Statistical Properties & Future Directions
+
+1. **Conservativeness of uncorrected pTFCE $p$-values in $[10^{-3}, 0.05]$:** Because `dclust` conditions on $H \ge Z_{\text{estThr}} = 1.3$ (omitting the unknown percolation factor $P(H \ge 1.3 \mid C) \le 1$), pTFCE uncorrected $p$-values are conservative in the moderate range ($p \in [10^{-3}, 0.05]$) and the enhanced field $\tilde{Z}$ is spatially smoother than the raw $Z$-map. Consequently, GRF FWER thresholding via raw `number_of_resels` is mildly conservative under stationary Gaussian noise (empirical FWER $\approx 0.02\text{–}0.03$ at nominal $\alpha = 0.05$), and naive Benjamini–Hochberg FDR on uncorrected `res$p` is also conservative.
+2. **Future enhancements planned for this fork:**
+   - **Non-stationary smoothness adjustment:** Using voxelwise local $\text{dLh}(v)$ from 4D residuals to measure cluster size in local resel volume rather than stationary voxel count.
+   - **Fast sign-flipping / parametric GRF $\max|\tilde{Z}|$ calibration:** Leveraging the ~0.15 s C++ engine to calibrate exact non-conservative FWER thresholds empirically when desired.

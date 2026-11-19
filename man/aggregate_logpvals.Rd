@@ -2,18 +2,18 @@
 % Please edit documentation in R/ptfce.r
 \name{aggregate_logpvals}
 \alias{aggregate_logpvals}
-\title{Aggregate logpvals by the "equidistant incremental logarithmic probability aggregation".}
+\title{Aggregate logpvals by equidistant incremental logarithmic probability aggregation}
 \usage{
 aggregate_logpvals(logpvals, d)
 }
 \arguments{
-\item{logpvals}{vector of enhnaced -logP values correspoinding tho various thresholds}
+\item{logpvals}{Vector of enhanced \code{-log(p)} values across thresholds.}
 
-\item{d}{delta -logP (giving the equidistant distribution in the log-space)}
+\item{d}{Step size \code{delta -log(p)}.}
 }
 \value{
-aggregated -logP probability
+Aggregated \code{-log(p)} value.
 }
 \description{
-Aggregate logpvals by the "equidistant incremental logarithmic probability aggregation".
+Aggregate logpvals by equidistant incremental logarithmic probability aggregation
 }

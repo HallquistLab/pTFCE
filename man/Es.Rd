@@ -2,22 +2,20 @@
 % Please edit documentation in R/ptfce.r
 \name{Es}
 \alias{Es}
-\title{expected value of cluster size at threshold h in img of size V with RESEL count Rd
-mainly ported from the source code of FSL (https://fsl.fmrib.ox.ac.uk/fsl/fslwiki)}
+\title{Expected cluster size at threshold h in image of volume V with roughness-volume Rd}
 \usage{
 Es(h, V, Rd)
 }
 \arguments{
-\item{h}{image height, that is, Z score threshold}
+\item{h}{Z-score cluster-forming threshold(s).}
 
-\item{V}{Number of voxels}
+\item{V}{Number of voxels in mask.}
 
-\item{Rd}{Rd (dLh*V)}
+\item{Rd}{Roughness-volume product (\code{dLh * V}).}
 }
 \value{
-Expected value of cluster size
+Expected value of cluster size in voxels.
 }
 \description{
-expected value of cluster size at threshold h in img of size V with RESEL count Rd
-mainly ported from the source code of FSL (https://fsl.fmrib.ox.ac.uk/fsl/fslwiki)
+Ported from FSL Gaussian Random Field cluster theory.
 }

@@ -2,106 +2,131 @@
 % Please edit documentation in R/ptfce.r
 \name{ptfce}
 \alias{ptfce}
-\title{pTFCE main function.}
+\title{Probabilistic Threshold-Free Cluster Enhancement (pTFCE)}
 \usage{
 ptfce(
   img,
-  mask,
+  mask = NULL,
   Rd = NA,
   V = NA,
   resels = NA,
-  residual = NA,
+  residual = NULL,
   dof = NA,
   logpmin = 0,
-  logpmax = -log(stats::pnorm(max(img), lower.tail = F)),
+  logpmax = NULL,
   ZestThr = 1.3,
-  Nh = 100,
-  verbose = T
+  Nh = NULL,
+  verbose = TRUE,
+  sided = c("positive", "two.sided", "negative"),
+  dh = 0.05,
+  connectivity = 6L,
+  fwe_p = 0.05,
+  legacy = FALSE
 )
 }
 \arguments{
-\item{img}{Nifti Z-score image to enhance ("nifti" class from "oro.nifti" package)}
+\item{img}{A 2D or 3D Z-score image to enhance: an \code{RNifti} \code{niftiImage},
+an \code{oro.nifti} \code{nifti} object, a numeric \code{array}, or a file path
+to a NIfTI file.}
 
-\item{mask}{Mask}
+\item{mask}{Spatial mask image of matching dimensions (optional; defaults to all
+voxels if omitted). Continuous masks are thresholded at \code{> 0.5}.}
 
-\item{Rd}{Resel count (FSL smoothest: VOLUME*DHL)}
+\item{Rd}{Roughness-volume product \code{V * dLh} (FSL \code{smoothest}: \code{VOLUME * DLH}).}
 
-\item{V}{Number of voxels in mask (FSL smoothest: VOLUME)}
+\item{V}{Number of voxels in mask (FSL \code{smoothest}: \code{VOLUME}).}
 
-\item{resels}{Resel size (FSL smoothest: RESELS)}
+\item{resels}{Resel size in voxels per resel (FSL \code{smoothest}: \code{RESELS}).}
 
-\item{residual}{4D residual data for a better estimate of image smoothness (optional)}
+\item{residual}{Optional 4D residual image (or file path) for accurate smoothness
+estimation via \code{\link{smoothest}}.}
 
-\item{dof}{Degrees of freedom (optional, but obligatory if residual is specified)}
+\item{dof}{Residual degrees of freedom (required when \code{residual} is supplied).}
 
-\item{logpmin}{min threshold (not safe to change the default)}
+\item{logpmin}{Minimum \code{-log(p)} threshold used in legacy discrete grid mode (default: \code{0}).}
 
-\item{logpmax}{max threshold (not safe to change the default)}
+\item{logpmax}{Maximum \code{-log(p)} threshold (optional; if supplied, activates legacy grid mode).}
 
-\item{ZestThr}{Cluster-forming Z threshold below which P(h|c) is estimated as P(h), due to limitation of GRF theory. (default: 1.3, not safe to change)}
+\item{ZestThr}{Cluster-forming Z threshold below which \code{P(H > h | C)} is treated
+as unenhanced \code{P(H > h)} due to GRF percolation limits (default: \code{1.3}).}
 
-\item{Nh}{Number of thresholds (not safe to change the default)}
+\item{Nh}{Number of discrete thresholds for legacy grid mode (default: \code{NULL},
+which uses the fixed-\code{dh} continuous sub-threshold integration grid; set e.g.
+\code{Nh = 100} or \code{legacy = TRUE} to reproduce upstream grid spacing).}
 
-\item{verbose}{boolean: print progress bar and diagnostic messages if true (default)}
+\item{verbose}{Logical; print progress/diagnostic messages if \code{TRUE} (default).}
+
+\item{sided}{Direction of enhancement: \code{"positive"} (default, upper tail \code{Z > 0}),
+\code{"two.sided"} (enhances both positive and negative tails symmetrically using a
+shared threshold grid and returns signed enhanced Z-scores and two-sided p-values),
+or \code{"negative"} (lower tail \code{Z < 0}).}
+
+\item{dh}{Step size in \code{-log(p)} space above \code{ZestThr} for the default
+grid-invariant integration mode (default: \code{0.05}). Ignored when \code{Nh} or
+\code{legacy = TRUE} is specified.}
+
+\item{connectivity}{Voxel neighborhood connectivity in 3D: \code{6} (faces touch, default;
+AFNI NN=1), \code{18} (faces or edges touch; AFNI NN=2), or \code{26} (faces, edges,
+or corners touch; AFNI NN=3).}
+
+\item{fwe_p}{Numeric vector of Family-Wise Error Rate alpha levels for which GRF
+Z-score thresholds are computed (default: \code{0.05}). In \code{sided = "two.sided"}
+mode, each tail is controlled at \code{fwe_p / 2} so \code{abs(Z) >= fwe.Z} controls
+two-sided FWER at \code{fwe_p}.}
+
+\item{legacy}{Logical; if \code{TRUE}, uses upstream \code{Nh}-point discrete summation
+from \code{logpmin} to \code{logpmax} instead of analytical sub-\code{ZestThr}
+integration with fixed \code{dh} (default: \code{FALSE}).}
 }
 \value{
-An object of class "ptfce" is a list containing at least the following components:
+An object of class \code{"ptfce"} (a list) containing:
 \itemize{
-\item{\strong{p} (uncorrected) pTFCE enhanced p-values}
-\item{\strong{logp}  negative logarithm of pTFCE enhanced p-values}
-\item{\strong{Z} pTFCE enhanced p-values converted to Z-scores}
-\item{\strong{number_of_resels} number of resels (input for e.g. ptoz) }
-\item{\strong{fwer0.05.Z} Z-score threshold corresponding to the corrected p<0.05 threshold, controlled for FWER}
+  \item \strong{p}: Uncorrected pTFCE-enhanced p-values (same image class as \code{img}).
+  \item \strong{logp}: Negative natural logarithm \code{-log(p)} of enhanced p-values.
+  \item \strong{Z}: Enhanced Z-score image (signed when \code{sided = "two.sided"}).
+  \item \strong{number_of_resels}: Estimated number of resels in the mask.
+  \item \strong{fwer0.05.Z}: GRF FWER Z-score threshold at \code{alpha = 0.05}
+    (adjusted to \code{0.025} per tail when \code{sided = "two.sided"}).
+  \item \strong{fwe.Z}: Named numeric vector of GRF FWER Z-score thresholds corresponding
+    to \code{fwe_p}.
+  \item \strong{sided}: Enhancement sidedness used.
 }
 }
 \description{
-The threshold-free cluster enhancement (TFCE) approach integrates cluster information into voxel-wise statistical inference to enhance detectability of neuroimaging signal. Despite the significantly increased sensitivity, the application of TFCE is limited by several factors: (i) generalization to data structures, like brain network connectivity data is not trivial, (ii) TFCE values are in an arbitrary unit, therefore, P-values can only be obtained by a computationally demanding permutation-test.
-Here, we introduce a probabilistic approach for TFCE (pTFCE), that gives a simple general framework for topology-based belief boosting.
-The core of pTFCE is a conditional probability, calculated based on Bayes' rule, from the probability of voxel intensity and the threshold-wise likelihood function of the measured cluster size. We provide an estimation of these distributions based on Gaussian Random Field (GRF) theory. The conditional probabilities are then aggregated across cluster-forming thresholds by a novel incremental aggregation method. Our approach is validated on simulated and real fMRI data.
-pTFCE is shown to be more robust to various ground truth shapes and provides a stricter control over cluster "leaking" than TFCE and, in the most realistic cases, further improves its sensitivity. Correction for multiple comparison can be trivially performed on the enhanced P-values, without the need for permutation testing, thus pTFCE is well-suitable for the improvement of statistical inference in any neuroimaging workflow.
+Enhances 2D or 3D statistical Z-score neuroimages by integrating multi-threshold
+cluster extent information via Bayes' rule and Gaussian Random Field (GRF) theory,
+producing enhanced p-values and Z-scores directly without permutation testing.
 }
 \details{
-The function takes a Z-score image and a mask image (both "nifti" object of the oro.nifti package) as obligatory inputs.
-Mask can be either binary or continous, in the latter case it will be thresholded at 0.5.
-Parameters V (number of voxels) and Rd (voxels per RESEL, computed as V*RESELS from the smoothest outpout) are optional and are to be interpreted as in FSL "smoothest".
-If you want pTFCE to compute FWER-based Z-threshold for correction of multiple comparisons, specify the parameter resels (resels field of smoothest), together with Rd and V.
-If not specified, these values are estimated from the data, internally via the smoothest() function of this package, which is a direct port of the corresponding FSL function.
-If Rd and/or V is not specified, and residual and dof is specified, image smoothness will be determined basedd on teh 4D residual data (more accurate, see ?smoothest()).
-For more details on smoothness estimation, see https://github.com/spisakt/pTFCE/wiki/Some-important-notes-on-smoothness-estimation.
-The default value of the parameter Nh should work with images having usual ranges of Z-scores. At low values, although the processing becomes faster, the estimation of the enhanced values might become inaccurate and the enhanced p-value distribution becomes increasingly non-uniform. It is not recommended to set it lower than 30.
-The parameters logpmin and logpmax define the range of values the incremental thresholding procedure covers. By default, these are based on the input data and it is not recommended to cahnge them.
+By default (\code{legacy = FALSE}, \code{Nh = NULL}), \code{ptfce()} evaluates the
+unenhanced sub-\code{ZestThr} interval \code{[0, -log(Phi(-ZestThr))]} analytically
+and integrates cluster-enhanced log-probabilities above \code{ZestThr} using a fixed
+step \code{dh = 0.05}. This eliminates two artifacts of the original discrete grid:
+(i) sensitivity of moderate clusters to distant high-Z peaks via \code{logpmax}, and
+(ii) the collapse of small-magnitude voxels around \code{Z = 0}.
+
+When \code{sided = "two.sided"}, positive (\code{Z > 0}) and negative (\code{Z < 0})
+excursion sets are enhanced independently on identical threshold grids:
+\itemize{
+  \item \code{$Z} contains signed enhanced Z-scores (\code{> 0} where input \code{Z > 0},
+    \code{< 0} where input \code{Z < 0}, \code{0} outside mask). Thresholding at
+    \code{abs(res$Z) >= res$fwer0.05.Z} controls two-sided FWER at \code{alpha = 0.05}.
+  \item \code{$p} contains two-sided uncorrected enhanced p-values \code{2 * Phi(-abs(Z))}.
+  \item \code{$logp} contains \code{-log(p)}.
+}
 }
 \examples{
-\dontrun{Z=readNIfTI("Zmap.nii.gz");
-
-MASK=readNIfTI("mask.nii.gz");
-
-# OPTION 1: use standalone with Z-map-based smoothness estimation
-pTFCE=ptfce(Z, MASK); # estimate smoothness based on the Z-score map
-# (might be inaccurate, but still guarantees FWER)
-
-#OPTION 2: use smoothness estimation based oj residual data (more accurate)
-RES4D=readNIfTI("res4D.nii.gz");
-pTFCE=ptfce(Z, MASK, residual=RES4D) # a bit slow, currently...
-
-#OPTION 2: equivalent to option2, but faster (uses FSL)
-# run FSL smoothest in the command line:
-# smoothest -r res4d.nii.gz -d DOF -m mask.nii.gz > smoothness.txt
-
-smooth=read.table("smoothness.txt"); # output by FSL smoothest
-pTFCE=ptfce(Z, V=smooth[2,2], Rd = smooth[1,2]*smooth[2,2], mask = MASK);
-
-# plot if you want
-orthographic(pTFCE$Z)
-
-# save NIfTI image
-writeNIfTI(pTFCE$Z, "pTFCE_Z")
-
-#See https://github.com/spisakt/pTFCE fro more examples
+\dontrun{
+# Standard bi-sided fMRI enhancement using 4D residuals for smoothness:
+res <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
+             residual = "res4d.nii.gz", dof = 42, sided = "two.sided")
+sig_map <- res$Z
+sig_map[abs(sig_map) < res$fwer0.05.Z] <- 0
 }
 }
 \references{
-T. Spisák, Z. Spisák, M. Zunhammer, U. Bingel, S. Smith, T. Nichols, T. Kincses, Probabilistic TFCE: a generalized combination of cluster size and voxel intensity to increase statistical power, Neuroimage.
-
-https://github.com/spisakt/pTFCE
+T. Spisák, Z. Spisák, M. Zunhammer, U. Bingel, S. Smith, T. Nichols, T. Kincses (2019).
+Probabilistic TFCE: a generalized combination of cluster size and voxel intensity
+to increase statistical power. \emph{NeuroImage}, 185, 12-26.
+\doi{10.1016/j.neuroimage.2018.09.078}
 }

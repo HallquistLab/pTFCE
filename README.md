@@ -1,21 +1,57 @@
-# pTFCE: probabilistic Threshold-free Cluster Enhancement 
+# pTFCE: Probabilistic Threshold-Free Cluster Enhancement (HallquistLab Fork)
 
+High-performance fork of [`spisakt/pTFCE`](https://github.com/spisakt/pTFCE) implementing **Probabilistic Threshold-Free Cluster Enhancement** (Spisák et al., 2019) with a fast C++ (`Rcpp`) engine, exact log-space posterior quadrature, and native bi-sided (two-tailed) fMRI inference.
 
-[![Open Source Love svg1](https://badges.frapsoft.com/os/v1/open-source.svg?v=103)](https://github.com/spisakt/pTFCE)
-[![Maintenance](https://img.shields.io/badge/Maintained%3F-yes-green.svg)](https://github.com/spisakt/pTFCE/graphs/commit-activity)
-[![GitHub license](https://img.shields.io/github/license/spisakt/pTFCE.svg)](https://github.com/spisakt/pTFCE/blob/master/LICENSE)
-[![GitHub release](https://img.shields.io/github/release/spisakt/pTFCE.svg)](https://github.com/spisakt/pTFCE/releases/)
-[![GitHub issues](https://img.shields.io/github/issues/spisakt/pTFCE.svg)](https://GitHub.com/spisakt/pTFCE/issues/)
-[![GitHub issues-closed](https://img.shields.io/github/issues-closed/spisakt/pTFCE.svg)](https://GitHub.com/spisakt/pTFCE/issues?q=is%3Aissue+is%3Aclosed)
+> **Detailed Technical Report on Fork Modifications:** See [`docs/fork_modifications_report.qmd`](docs/fork_modifications_report.qmd) for mathematical derivations, benchmarks, and a full record of all statistical, numerical, and API departures from upstream `spisakt/pTFCE` (`v0.2.2.1`).
 
-For more information, check out the [project pages](https://spisakt.github.io/pTFCE/)!
+## Installation
 
-For a detailed description and theory, please refer to (and please cite):
+```r
+remotes::install_github("HallquistLab/pTFCE")
+```
 
+## Key Enhancements in This Fork (`v0.3.0`)
 
-> _Tamás Spisák, Zsófia Spisák, Matthias Zunhammer, Ulrike Bingel, Stephen Smith, Thomas Nichols, Tamás Kincses, Probabilistic TFCE: a generalised combination of cluster size and voxel intensity to increase statistical power. Neuroimage, 185:12-26._ [DOI: 10.1016/j.neuroimage.2018.09.078](https://doi.org/10.1016/j.neuroimage.2018.09.078)
+- **Fast `Rcpp` Engine (~400–900x Faster, Minimal Memory):**
+  - Replaces repeated 3D connected-component labeling (`mmand::components` + `table`) and 4D intermediate voxel-by-threshold arrays with a **single-pass descending Union-Find (Disjoint-Set)** sweep in C++ (~0.33 s for a whole-brain bi-sided contrast vs. ~2.5–5 min previously).
+  - Replaces slow triple-nested R loops in `smoothest()` with a cache-friendly, zero-copy C++ estimator for both 3D Z-maps (`0.006 s`) and 4D GLM residual images (`res4d`, `0.08 s`).
+  - Drops `mmand` dependency; supports `RNifti` (`niftiImage`), `oro.nifti` (`nifti`, optional), plain R `array`s, and NIfTI file paths directly.
+- **Native Bi-Sided (`sided = "two.sided"`) Enhancement:**
+  - Enhances positive (`Z > 0`) and negative (`Z < 0`) excursion sets symmetrically using an identical threshold resolution, returning signed enhanced Z-scores (`$Z`), two-sided uncorrected p-values (`$p`), `-log(p)` (`$logp`), and two-sided GRF FWER thresholds (`$fwer0.05.Z`, `$fwe.Z`).
+- **Grid-Invariant Integration (`dh = 0.05` + Analytical Sub-`ZestThr`):**
+  - Evaluates the unenhanced interval `[0, -log(Phi(-ZestThr))]` analytically and integrates above `ZestThr` with a fixed step `dh = 0.05`.
+  - Eliminates cross-cluster interference from distant extreme Z-peaks (`Z_max` no longer coarsens step size `dh`) and removes the ~20% zero dead-zone around `Z = 0` as well as the `-8.21` out-of-mask floor. Legacy `Nh`-grid behavior remains available via `Nh = 100` or `legacy = TRUE`.
+- **Exact Log-Space Bayesian Quadrature (Zero `NaN`s or Underflow):**
+  - Replaces nested `stats::integrate(..., -Inf, Inf)` calls with mode-shifted log-space adaptive Gauss-Kronrod quadrature and per-cluster-size caching, completely eliminating `p > 1` cluster-border `NaN`s, silent score deflation inside large clusters, and `Z = 37.5` underflow ceilings.
+- **Additional Utilities:**
+  - `t2z(img, dof)` for exact log-space Student's *t*-to-*Z* conversion without overflow at high `|t|`.
+  - `connectivity = c(6, 18, 26)` (matching AFNI `NN = 1, 2, 3`).
+  - Vectorized log-space Newton-Raphson `fwe.p2z()` and `fwe.z2p()`.
 
+## Quick Start
 
+```r
+library(pTFCE)
 
+# Bi-sided pTFCE enhancement using 4D GLM residuals for smoothness estimation
+res <- ptfce(
+  img = "zstat1.nii.gz",
+  mask = "mask.nii.gz",
+  residual = "res4d.nii.gz",
+  dof = 42,
+  sided = "two.sided",
+  fwe_p = c(0.05, 0.01)
+)
 
-![image](img/graphical_abstract.png)
+# Signed enhanced Z-map (RNifti niftiImage when given file paths)
+RNifti::writeNifti(res$Z, "zstat1_ptfce.nii.gz")
+
+# Threshold at two-sided FWER p < 0.05
+z_thr <- res$Z
+z_thr[abs(z_thr) < res$fwer0.05.Z] <- 0
+RNifti::writeNifti(z_thr, "zstat1_ptfce_fwep0.05.nii.gz")
+```
+
+## Reference
+
+> Tamás Spisák, Zsófia Spisák, Matthias Zunhammer, Ulrike Bingel, Stephen Smith, Thomas Nichols, Tamás Kincses (2019). *Probabilistic TFCE: a generalized combination of cluster size and voxel intensity to increase statistical power.* NeuroImage, 185, 12–26. [DOI: 10.1016/j.neuroimage.2018.09.078](https://doi.org/10.1016/j.neuroimage.2018.09.078)

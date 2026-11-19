@@ -1,641 +1,724 @@
-#main function and helper functions for pTFCE R package
+#' @useDynLib pTFCE, .registration = TRUE
+#' @importFrom Rcpp evalCpp
+NULL
 
-
-#main function
-
-#' pTFCE main function.
+#' Probabilistic Threshold-Free Cluster Enhancement (pTFCE)
 #'
-#' The threshold-free cluster enhancement (TFCE) approach integrates cluster information into voxel-wise statistical inference to enhance detectability of neuroimaging signal. Despite the significantly increased sensitivity, the application of TFCE is limited by several factors: (i) generalization to data structures, like brain network connectivity data is not trivial, (ii) TFCE values are in an arbitrary unit, therefore, P-values can only be obtained by a computationally demanding permutation-test.
-#' Here, we introduce a probabilistic approach for TFCE (pTFCE), that gives a simple general framework for topology-based belief boosting.
-#' The core of pTFCE is a conditional probability, calculated based on Bayes' rule, from the probability of voxel intensity and the threshold-wise likelihood function of the measured cluster size. We provide an estimation of these distributions based on Gaussian Random Field (GRF) theory. The conditional probabilities are then aggregated across cluster-forming thresholds by a novel incremental aggregation method. Our approach is validated on simulated and real fMRI data.
-#' pTFCE is shown to be more robust to various ground truth shapes and provides a stricter control over cluster "leaking" than TFCE and, in the most realistic cases, further improves its sensitivity. Correction for multiple comparison can be trivially performed on the enhanced P-values, without the need for permutation testing, thus pTFCE is well-suitable for the improvement of statistical inference in any neuroimaging workflow.
+#' Enhances 2D or 3D statistical Z-score neuroimages by integrating multi-threshold
+#' cluster extent information via Bayes' rule and Gaussian Random Field (GRF) theory,
+#' producing enhanced p-values and Z-scores directly without permutation testing.
 #'
 #' @references
-#' T. Spisák, Z. Spisák, M. Zunhammer, U. Bingel, S. Smith, T. Nichols, T. Kincses, Probabilistic TFCE: a generalized combination of cluster size and voxel intensity to increase statistical power, Neuroimage.
+#' T. Spisák, Z. Spisák, M. Zunhammer, U. Bingel, S. Smith, T. Nichols, T. Kincses (2019).
+#' Probabilistic TFCE: a generalized combination of cluster size and voxel intensity
+#' to increase statistical power. \emph{NeuroImage}, 185, 12-26.
+#' \doi{10.1016/j.neuroimage.2018.09.078}
 #'
-#' https://github.com/spisakt/pTFCE
+#' @param img A 2D or 3D Z-score image to enhance: an \code{RNifti} \code{niftiImage},
+#'   an \code{oro.nifti} \code{nifti} object, a numeric \code{array}, or a file path
+#'   to a NIfTI file.
+#' @param mask Spatial mask image of matching dimensions (optional; defaults to all
+#'   voxels if omitted). Continuous masks are thresholded at \code{> 0.5}.
+#' @param Rd Roughness-volume product \code{V * dLh} (FSL \code{smoothest}: \code{VOLUME * DLH}).
+#' @param V Number of voxels in mask (FSL \code{smoothest}: \code{VOLUME}).
+#' @param resels Resel size in voxels per resel (FSL \code{smoothest}: \code{RESELS}).
+#' @param residual Optional 4D residual image (or file path) for accurate smoothness
+#'   estimation via \code{\link{smoothest}}.
+#' @param dof Residual degrees of freedom (required when \code{residual} is supplied).
+#' @param logpmin Minimum \code{-log(p)} threshold used in legacy discrete grid mode (default: \code{0}).
+#' @param logpmax Maximum \code{-log(p)} threshold (optional; if supplied, activates legacy grid mode).
+#' @param ZestThr Cluster-forming Z threshold below which \code{P(H > h | C)} is treated
+#'   as unenhanced \code{P(H > h)} due to GRF percolation limits (default: \code{1.3}).
+#' @param Nh Number of discrete thresholds for legacy grid mode (default: \code{NULL},
+#'   which uses the fixed-\code{dh} continuous sub-threshold integration grid; set e.g.
+#'   \code{Nh = 100} or \code{legacy = TRUE} to reproduce upstream grid spacing).
+#' @param verbose Logical; print progress/diagnostic messages if \code{TRUE} (default).
+#' @param sided Direction of enhancement: \code{"positive"} (default, upper tail \code{Z > 0}),
+#'   \code{"two.sided"} (enhances both positive and negative tails symmetrically using a
+#'   shared threshold grid and returns signed enhanced Z-scores and two-sided p-values),
+#'   or \code{"negative"} (lower tail \code{Z < 0}).
+#' @param dh Step size in \code{-log(p)} space above \code{ZestThr} for the default
+#'   grid-invariant integration mode (default: \code{0.05}). Ignored when \code{Nh} or
+#'   \code{legacy = TRUE} is specified.
+#' @param connectivity Voxel neighborhood connectivity in 3D: \code{6} (faces touch, default;
+#'   AFNI NN=1), \code{18} (faces or edges touch; AFNI NN=2), or \code{26} (faces, edges,
+#'   or corners touch; AFNI NN=3).
+#' @param fwe_p Numeric vector of Family-Wise Error Rate alpha levels for which GRF
+#'   Z-score thresholds are computed (default: \code{0.05}). In \code{sided = "two.sided"}
+#'   mode, each tail is controlled at \code{fwe_p / 2} so \code{abs(Z) >= fwe.Z} controls
+#'   two-sided FWER at \code{fwe_p}.
+#' @param legacy Logical; if \code{TRUE}, uses upstream \code{Nh}-point discrete summation
+#'   from \code{logpmin} to \code{logpmax} instead of analytical sub-\code{ZestThr}
+#'   integration with fixed \code{dh} (default: \code{FALSE}).
 #'
-#' @param img Nifti Z-score image to enhance ("nifti" class from "oro.nifti" package)
-#' @param mask Mask
-#' @param Rd Resel count (FSL smoothest: VOLUME*DHL)
-#' @param V Number of voxels in mask (FSL smoothest: VOLUME)
-#' @param resels Resel size (FSL smoothest: RESELS)
-#' @param residual 4D residual data for a better estimate of image smoothness (optional)
-#' @param dof Degrees of freedom (optional, but obligatory if residual is specified)
-#' @param Nh Number of thresholds (not safe to change the default)
-#' @param logpmin min threshold (not safe to change the default)
-#' @param logpmax max threshold (not safe to change the default)
-#' @param ZestThr Cluster-forming Z threshold below which P(h|c) is estimated as P(h), due to limitation of GRF theory. (default: 1.3, not safe to change)
-#' @param verbose boolean: print progress bar and diagnostic messages if true (default)
+#' @details
+#' By default (\code{legacy = FALSE}, \code{Nh = NULL}), \code{ptfce()} evaluates the
+#' unenhanced sub-\code{ZestThr} interval \code{[0, -log(Phi(-ZestThr))]} analytically
+#' and integrates cluster-enhanced log-probabilities above \code{ZestThr} using a fixed
+#' step \code{dh = 0.05}. This eliminates two artifacts of the original discrete grid:
+#' (i) sensitivity of moderate clusters to distant high-Z peaks via \code{logpmax}, and
+#' (ii) the collapse of small-magnitude voxels around \code{Z = 0}.
 #'
-#' @details The function takes a Z-score image and a mask image (both "nifti" object of the oro.nifti package) as obligatory inputs.
-#' Mask can be either binary or continous, in the latter case it will be thresholded at 0.5.
-#' Parameters V (number of voxels) and Rd (voxels per RESEL, computed as V*RESELS from the smoothest outpout) are optional and are to be interpreted as in FSL "smoothest".
-#' If you want pTFCE to compute FWER-based Z-threshold for correction of multiple comparisons, specify the parameter resels (resels field of smoothest), together with Rd and V.
-#' If not specified, these values are estimated from the data, internally via the smoothest() function of this package, which is a direct port of the corresponding FSL function.
-#' If Rd and/or V is not specified, and residual and dof is specified, image smoothness will be determined basedd on teh 4D residual data (more accurate, see ?smoothest()).
-#' For more details on smoothness estimation, see https://github.com/spisakt/pTFCE/wiki/Some-important-notes-on-smoothness-estimation.
-#' The default value of the parameter Nh should work with images having usual ranges of Z-scores. At low values, although the processing becomes faster, the estimation of the enhanced values might become inaccurate and the enhanced p-value distribution becomes increasingly non-uniform. It is not recommended to set it lower than 30.
-#' The parameters logpmin and logpmax define the range of values the incremental thresholding procedure covers. By default, these are based on the input data and it is not recommended to cahnge them.
-#'
-#' @return An object of class "ptfce" is a list containing at least the following components:
+#' When \code{sided = "two.sided"}, positive (\code{Z > 0}) and negative (\code{Z < 0})
+#' excursion sets are enhanced independently on identical threshold grids:
 #' \itemize{
-#' \item{\strong{p} (uncorrected) pTFCE enhanced p-values}
-#' \item{\strong{logp}  negative logarithm of pTFCE enhanced p-values}
-#' \item{\strong{Z} pTFCE enhanced p-values converted to Z-scores}
-#' \item{\strong{number_of_resels} number of resels (input for e.g. ptoz) }
-#' \item{\strong{fwer0.05.Z} Z-score threshold corresponding to the corrected p<0.05 threshold, controlled for FWER}
+#'   \item \code{$Z} contains signed enhanced Z-scores (\code{> 0} where input \code{Z > 0},
+#'     \code{< 0} where input \code{Z < 0}, \code{0} outside mask). Thresholding at
+#'     \code{abs(res$Z) >= res$fwer0.05.Z} controls two-sided FWER at \code{alpha = 0.05}.
+#'   \item \code{$p} contains two-sided uncorrected enhanced p-values \code{2 * Phi(-abs(Z))}.
+#'   \item \code{$logp} contains \code{-log(p)}.
 #' }
 #'
-#' @export
-#'
-#' @examples \dontrun{Z=readNIfTI("Zmap.nii.gz");
-#'
-#' MASK=readNIfTI("mask.nii.gz");
-#'
-#' # OPTION 1: use standalone with Z-map-based smoothness estimation
-#' pTFCE=ptfce(Z, MASK); # estimate smoothness based on the Z-score map
-#' # (might be inaccurate, but still guarantees FWER)
-#'
-#' #OPTION 2: use smoothness estimation based oj residual data (more accurate)
-#' RES4D=readNIfTI("res4D.nii.gz");
-#' pTFCE=ptfce(Z, MASK, residual=RES4D) # a bit slow, currently...
-#'
-#' #OPTION 2: equivalent to option2, but faster (uses FSL)
-#' # run FSL smoothest in the command line:
-#' # smoothest -r res4d.nii.gz -d DOF -m mask.nii.gz > smoothness.txt
-#'
-#' smooth=read.table("smoothness.txt"); # output by FSL smoothest
-#' pTFCE=ptfce(Z, V=smooth[2,2], Rd = smooth[1,2]*smooth[2,2], mask = MASK);
-#'
-#' # plot if you want
-#' orthographic(pTFCE$Z)
-#'
-#' # save NIfTI image
-#' writeNIfTI(pTFCE$Z, "pTFCE_Z")
-#'
-#' #See https://github.com/spisakt/pTFCE fro more examples
-#' }
-ptfce=function(img, mask, Rd=NA, V=NA, resels=NA, residual=NA, dof=NA,  logpmin=0, logpmax=-log(stats::pnorm(max(img), lower.tail = F)), ZestThr=1.3, Nh=100, verbose=T )
-{
-  if (length(img[is.na(img)])>0)
-  {
-    warning("NAs detected and replaced with zero!")
-    img[is.na(img)] = 0
-  }
-  if (length(img[!is.finite(img)])>0)
-  {
-    warning("Infinite values detected and replaced with zero!")
-    img[!is.finite(img)] = 0
-  }
-  autosmooth=F
-  if (is.na(Rd) || is.na(V))
-  {
-    autosmooth=T
-    if (!is.na(residual))
-    {
-        if (!is.na(dof))
-        {
-          warning("Smoothness estimatmion based on 4D residual data is suboptimal and might be slow! Consider using FSL smoothest instead!")
-          smooth=smoothest(residual, mask, dof = dof,  verbose = verbose)
-        }
-        else
-        {
-          warning("Residual but no dof specified: defaulting back to Z-score map-based smoothnes estimation")
-          smooth=smoothest(img, mask, verbose = verbose)
-        }
-    }
-    else
-    {
-      smooth=smoothest(img, mask, verbose = verbose)
-    }
-    V=smooth$volume
-    Rd=smooth$dLh*V
-  }
-
-  logp.thres=seq(logpmin, logpmax, length.out=Nh)
-  dh=logp.thres[2]-logp.thres[1]
-  p.thres=exp(-logp.thres)
-  threshs=stats::qnorm(p.thres, lower.tail = F)
-  threshs[1]=-9999999999 # exp(-Inf):=0 #TODO: machine minimum
-  ndh = length(threshs)
-  CLUST=array(NA, dim=c(dim(img), length(threshs)))
-  PVC=array(1, dim=c(dim(img), length(threshs)))
-
-  if (verbose) cat("* Performing pTFCE...\n")
-  if (verbose) pb <- utils::txtProgressBar(style = 3)
-  for (hi in 1:length(threshs))
-  {
-    if (verbose) utils::setTxtProgressBar(pb, hi/length(threshs))
-    h=threshs[hi]
-    thr=img
-    thr[img>h]=1
-    thr[img<=h]=0
-    ccc=mmand::components(thr, kernel = mmand::shapeKernel(3, dim = 3, type = "diamond"))
-    t=table(ccc)
-    sizes=t[ccc]
-    sizes=sizes*as.numeric(mask)
-
-    CLUST[,,,hi]=sizes
-
-    for (size in sort(unique(sizes)) )
-    {
-      if (size==0)
-        next;
-      PVC[,,,hi][sizes==size]=pvox.clust(V, Rd, size, h, ZestThr=ZestThr)
-    }
-    # plot if you want
-    # orthographic(nifti(CLUST[,,, hi], datatype=16) )
-  }
-  # calculate pTFCE
-  pTFCE=array(apply(PVC, c(1,2,3), function(x){exp( -aggregate_logpvals(-log(x), dh) )}), dim=dim(img))
-
-  # copy nifit header information
-  snames = methods::slotNames(img)
-  snames = snames[ !snames %in% c(".Data", "dim_") ]
-  pTFCE = oro.nifti::nifti(img = pTFCE, dim = dim(pTFCE))
-  #BUG: this does not work if input is an array instead of nifti image
-  class(pTFCE) = class(img)
-  oro.nifti::datatype(pTFCE) = 16 # FLOAT32
-  oro.nifti::bitpix(pTFCE) = 32 # FLOAT32
-  pTFCE=oro.nifti::zero_trans(pTFCE)
-  for (islot in snames) {
-    methods::slot(pTFCE, islot) = methods::slot(img, islot)
-  }
-  # done copying header
-
-  pTFCE[pTFCE==0]=.Machine$double.xmin #underflow
-  pTFCE[pTFCE==1]=1-.Machine$double.neg.eps #underflow
-  if (verbose) close(pb)
-  if (autosmooth)
-  {
-    number_of_resels=smooth$volume / smooth$resels
-    fwer0.05.Z=fwe.p2z(number_of_resels, 0.05)
-  }
-  else
-  {
-    if (is.na(resels))
-    {
-      warning("For GRF-based FWER correction, please specify resels, or use smoothness estimation based on the data, by not specifying Rd and V!")
-      number_of_resels=NA
-      fwer0.05.Z=NA
-    }
-    else
-    {
-      number_of_resels=V / resels
-      fwer0.05.Z=fwe.p2z(number_of_resels, 0.05)
-    }
-
-  }
-  Z=stats::qnorm(pTFCE, lower.tail = F)
-  oro.nifti::datatype(Z) = 16 # FLOAT32
-  oro.nifti::bitpix(Z) = 32 # FLOAT32
-  Z=oro.nifti::zero_trans(Z)
-  return(list(p=pTFCE,
-              logp=-log(pTFCE),
-              Z=Z,
-              number_of_resels=number_of_resels,
-              fwer0.05.Z=fwer0.05.Z
-              )
-         )
-}
-
-# helper functions
-
-#' Aggregate logpvals by the "equidistant incremental logarithmic probability aggregation".
-#'
-#' @param logpvals vector of enhnaced -logP values correspoinding tho various thresholds
-#' @param d delta -logP (giving the equidistant distribution in the log-space)
-#'
-#' @return aggregated -logP probability
-#' @export
-aggregate_logpvals=function(logpvals, d) #
-{
-  logpvals[is.infinite(logpvals)]=745
-  s=sum(logpvals)
-  return( 0.5*(sqrt(d*(8*s+d))-d) )
-}
-
-#' expected value of cluster size at threshold h in img of size V with RESEL count Rd
-#' mainly ported from the source code of FSL (https://fsl.fmrib.ox.ac.uk/fsl/fslwiki)
-#'
-#' @param h image height, that is, Z score threshold
-#' @param V Number of voxels
-#' @param Rd Rd (dLh*V)
-#'
-#' @return Expected value of cluster size
-Es=function(h, V, Rd)
-{
-  h2=h*h
-  ret=  ( log(V)+stats::pnorm(h, log.p = T, lower.tail = F) )
-  h2=h2[h>=1.1]
-  ret[h>=1.1] = ret[h>=1.1] - ( log(Rd)+log(h2-1)-h2/2+-2*log(2*pi) ) # from FSL
-
-  return( exp(ret) )
-
-}
-
-dvox=function(h) # PDF of Z threshold/voxel value
-{
-  stats::dnorm(h )
-}
-
-pvox=function(h) # p-value for voxel value
-{
-  stats::pnorm(h, lower.tail = F)
-}
-
-dclust=function(h, V, Rd, c, ZestThr=1.3, CONST=10^40) # PDF of cluster extent, given h thershold
-{
-  if (is.na(c))
-    return(dvox(h))
-  dcl=function(h, V, Rd, c)
-  {
-    lambda=(Es(h, V, Rd)/gamma(2.5) )^(-2/3)
-    dclust=lambda*exp(-lambda*c^(2/3))
-    #dclust[dclust==0]=.Machine$double.xmin # underflow happened
-    dclust[h<ZestThr]=0
-    dclust
-  }
-  # patch: the normalising constant can be ignored here as the expression will be normalised again later
-  # So we spare a costly numarical integration and get much faster!
-  # Tests still pass, with a tolearnce
-  #dcl(h, V, Rd, c)#/integrate(function(x){dcl(x, V, Rd, c)}, -Inf, Inf)$value
-
-  #bugfix (GitHUb Issue #8)
-  # we can multiply to avoid underflow in the integration in dvox.clust
-  # it will be normalised anyway
-  dcl(h, V, Rd, c)*CONST
-}
-
-dvox.clust=function(h, V, Rd, c, ZestThr=1.3) # PDF of Z threshold value given cluster size
-{
-  if (is.na(c))
-    #return(rep(0, length(h)))
-    return(dvox(h))
-  if (is.nan(dclust(h, V, Rd, c)[1])) # underflow
-    return(dvox(h)*dclust(h, V, Rd, c))
-
-  dvox(h)*dclust(h, V, Rd, c, ZestThr)/stats::integrate(function(x){dvox(x)*dclust(x, V, Rd, c, ZestThr)}, -Inf, Inf)$value
-}
-
-pvox.clust=function(V, Rd, c, actH, ZestThr=1.3) # p-value for Z threshold value given cluster size
-{
-  if (actH<=ZestThr)  # ZestThr: GRF theory might not apply at low thresholds
-    return(pvox(actH))
-
-  if (is.nan(dvox.clust(actH, V, Rd, c, ZestThr=ZestThr)[1])) # underflow
-    return(exp(-745)) #TODO: make machnie independent
-
-  stats::integrate(function(x){dvox.clust(x, V, Rd, c, ZestThr=ZestThr)}, actH, Inf)$value
-}
-
-#' Estimate global image smoothness.
-#'
-#' Ported form the C++ implementation of FSL.
-#'
-#' For mathematical background, see:
-#' https://www.fmrib.ox.ac.uk/datasets/techrep/tr00df1/tr00df1/index.html
-#'
-#' @param img Z-score image or a 4D residual image, ("nifti" class from
-#'   "oro.nifti" package)
-#' @param mask image mask ("nifti" class from "oro.nifti" package)
-#' @param dof degrees of freedom, obligatory if img is a 4D residual image
-#' @param verbose boolean: print progress bar and diagnostic messages if true
-#'   (default)
-#'
-#' @return An object of class "smoothness" is a list containing at least the
-#'   following components:
-#'   \itemize{
-#'   \item \strong{volume}   volume of the mask used for estimating smoothness, in voxels
-#'
-#'   \item \strong{sigmasq}  sigma squared values in the x, y and z directions
-#'
-#'   \item \strong{FWHM}     full width at half maximum values of smoothness in the x, y and z
-#'   direction (voxels)
-#'
-#'   \item \strong{dLh}      determininant of Lambda to the half (voxels^-3)
-#'
-#'   \item \strong{resels}   resel size (voxels per resel) }
-#' @export
-#'
-#' @details The function takes two images (both "nifti" object of the oro.nifti
-#'   package): (i) either a Z-score image or a 4D residual image together with
-#'   the degrees of freedom, and (ii) a mask image as obligatory inputs. Mask
-#'   can be either binary or continous, in the latter case it will be
-#'   thresholded at 0.5.
-#'
-#'   For a Gaussian random field the smoothness is defined as  \deqn{W
-#'   =|\Lambda|^{-1/2D} } where D is the dimensionality of the field and
-#'   \eqn{\Lambda} the covariance matrix of it's first partial derivatives.
-#'
-#'   Using Z-score image is less optimal because:
+#' @return An object of class \code{"ptfce"} (a list) containing:
 #' \itemize{
-#' \item Smoothness estimates need spatial derivatives, which are very noisy
-#'   quantities and, for a single 3D map, can be computed just once on each
-#'   direction.
-#' \item The z-map may contain effects, and these affect smoothness.
+#'   \item \strong{p}: Uncorrected pTFCE-enhanced p-values (same image class as \code{img}).
+#'   \item \strong{logp}: Negative natural logarithm \code{-log(p)} of enhanced p-values.
+#'   \item \strong{Z}: Enhanced Z-score image (signed when \code{sided = "two.sided"}).
+#'   \item \strong{number_of_resels}: Estimated number of resels in the mask.
+#'   \item \strong{fwer0.05.Z}: GRF FWER Z-score threshold at \code{alpha = 0.05}
+#'     (adjusted to \code{0.025} per tail when \code{sided = "two.sided"}).
+#'   \item \strong{fwe.Z}: Named numeric vector of GRF FWER Z-score thresholds corresponding
+#'     to \code{fwe_p}.
+#'   \item \strong{sided}: Enhancement sidedness used.
 #' }
-smoothest=function(img, mask, dof=NA, verbose=T)
-{
-  if (verbose) cat("* Estimating smoothness based on the data...\n")
-  if (verbose) pb <- utils::txtProgressBar(style = 3)
-
-  stand = standardise(mask, img);
-  mask_volume=stand$count
-  mask=stand$mask
-  img=stand$R
-  N=0
-
-  usez=T
-  if (dim(img)[3] <= 1)
-  {
-    usez = F;
-    warning("using 2d image mode, but it is not tested yet")
-  }
-
-  # Estimate the smoothness of the normalised residual field
-  # see TR00DF1 for mathematical description of the algorithm.
-  X = 1
-  Y = 2
-  Z = 3
-  SSminus = c(0, 0, 0)
-  S2 = c(0, 0, 0)
-
-  # adjust zstart for 2d mode
-  zstart=2
-  if (!usez) zstart=1
-  for (z in 2:dim(img)[3])
-  {
-    if (verbose) utils::setTxtProgressBar(pb, z/dim(img)[3])
-    for (y in 2:dim(img)[2])
-    {
-      for (x in 2:dim(img)[1])
-      {
-        # Sum over N
-        if( (mask[x, y, z]>0.5) &&
-            (mask[x-1, y, z]>0.5) &&
-            (mask[x, y-1, z]>0.5) &&
-            ( (!usez) || (mask[x, y, z-1]>0.5) ) )
-        {
-          N=N+1
-
-          if (!is.na(dim(img)[4])) # using res4D
-          {
-            for ( t in 1:dim(img)[4])
-            {
-              # Sum over M
-              SSminus[X] =  SSminus[X] + img[x, y, z, t] * img[x-1, y, z, t]
-              SSminus[Y] = SSminus[Y] + img[x, y, z, t] * img[x, y-1, z, t]
-              if (usez) SSminus[Z] = SSminus[Z] + img[x, y, z, t] * img[x, y, z-1, t]
-
-              S2[X] = S2[X] + 0.5 * (img[x, y, z, t]*img[x, y, z, t] + img[x-1, y, z, t]*img[x-1, y, z, t])
-              S2[Y] = S2[Y] + 0.5 * (img[x, y, z, t]*img[x, y, z, t] + img[x, y-1, z, t]*img[x, y-1, z, t])
-              if (usez) S2[Z] = S2[Z] + 0.5 * (img[x, y, z, t]*img[x, y, z, t] + img[x, y, z-1, t]*img[x, y, z-1, t])
-            }
-          }
-          else # using Z-score map
-          {
-            SSminus[X] =  SSminus[X] + img[x, y, z] * img[x-1, y, z]
-            SSminus[Y] = SSminus[Y] + img[x, y, z] * img[x, y-1, z]
-            if (usez) SSminus[Z] = SSminus[Z] + img[x, y, z] * img[x, y, z-1]
-
-            S2[X] = S2[X] + 0.5 * (img[x, y, z]*img[x, y, z] + img[x-1, y, z]*img[x-1, y, z])
-            S2[Y] = S2[Y] + 0.5 * (img[x, y, z]*img[x, y, z] + img[x, y-1, z]*img[x, y-1, z])
-            if (usez) S2[Z] = S2[Z] + 0.5 * (img[x, y, z]*img[x, y, z] + img[x, y, z-1]*img[x, y, z-1])
-
-          }
-        } # endif mask
-      } #endz
-    } #endy
-  } #endx
-  norm = 1.0/N
-  v = dof # v - degrees of freedom (nu)
-  if (!is.na(dim(img)[4])) # using res4D
-  {
-    print(paste("Non-edge voxels = ", N))
-    print(paste("(v - 2)/(v - 1) = ", (v - 2)/(v - 1)))
-
-    norm = (v - 2) / ((v - 1) * N * dim(img)[4]);
-  }
-  #print(paste("SSminus[X]", SSminus[X], "SSminus[Y]", SSminus[Y],"SSminus[Z]", SSminus[Z],"S2[X]", S2[X],"S2[Y]", S2[Y],"S2[Z]", S2[Z]))
-
-  # for extreme smoothness
-  if (SSminus[X]>=0.99999999*S2[X])
-  {
-    SSminus[X]=0.99999*S2[X]
-    warning("Extreme smoothness detected in X - possibly biased global estimate.")
-  }
-  if (SSminus[Y]>=0.99999999*S2[Y])
-  {
-    SSminus[Y]=0.99999*S2[Y]
-    warning("Extreme smoothness detected in Y - possibly biased global estimate.")
-  }
-  if (usez)
-  {
-    if (SSminus[Z]>=0.99999999*S2[Z])
-    {
-      SSminus[Z]=0.99999*S2[Z]
-      warning("Extreme smoothness detected in Z - possibly biased global estimate.")
-    }
-  }
-
-  # Convert to sigma squared
-  sigmasq=rep(NA,3);
-
-  sigmasq[X] = -1.0 / (4 * log(abs(SSminus[X]/S2[X])))
-  sigmasq[Y] = -1.0 / (4 * log(abs(SSminus[Y]/S2[Y])))
-  if (usez)
-  {
-    sigmasq[Z] = -1.0 / (4 * log(abs(SSminus[Z]/S2[Z])))
-  }
-  else
-  {
-    sigmasq[Z]=0
-  }
-  names(sigmasq)=c("x", "y", "z")
-
-  # the following is determininant of Lambda to the half
-  # i.e. dLh = | Lambda |^(1/2)
-  # Furthermore, W_i = 1/(2.lambda_i) = sigma_i^2 =>
-  #   det(Lambda) = det( lambda_i ) = det ( (2 W_i)^-1 ) = (2^D det(W))^-1
-  #   where D = number of dimensions (2 or 3)
-  if (usez)
-  {
-    dLh=((sigmasq[X]*sigmasq[Y]*sigmasq[Z])^-0.5)*(8^-0.5)
-  }
-  else
-  {
-    dLh=((sigmasq[X]*sigmasq[Y])^-0.5)*(4^-0.5)
-  }
-  #correcting for temporal DOF!!!!!
-  if(!is.na(dim(img)[4]))
-    dLh = dLh * interpolate(v);
-
-  # Convert to full width half maximum
-  FWHM=rep(NA,3)
-  FWHM[X] = sqrt(8 * log(2) * sigmasq[X])
-  FWHM[Y] = sqrt(8 * log(2) * sigmasq[Y])
-  if (usez)
-  {
-    FWHM[Z] = sqrt(8 * log(2) * sigmasq[Z])
-  }
-  else
-  {
-    FWHM[Z]=0
-  }
-  names(FWHM)=c("x", "y", "z")
-
-  resels = FWHM[X] * FWHM[Y]
-  if (usez)
-    resels = resels * FWHM[Z]
-
-  if (verbose) close(pb)
-
-  return(list(volume=mask_volume,
-              sigmasq=sigmasq,
-              FWHM=FWHM,
-              dLh=dLh,
-              resels=resels))
-}
-
-standardise=function(mask, R)
-{
-  M=dim(R)[4]
-  if( !is.na(M) )
-  {
-    # For each voxel
-    #    standardise data in 4th direction
-    R=aperm(apply(R, c(1,2,3), scale), c(2,3,4,1))
-    R[is.na(R)]=0
-    std=apply(R, c(1,2,3), stats::sd)
-    mask[std<=0]=0 #TODO_ready: updtae mask if it differs from the actual data
-
-  }#endif 4d
-  mask[is.na(mask)]=0
-
-  count=sum(mask[mask>0.5])
-
-  return(list(count=count, mask=mask, R=R))
-}
-
-interpolate=function(v)
-{
-  lut=rep(NA,500)
-    lut[5]   = 1.5423138; lut[6]   = 1.3757105; lut[7]   = 1.2842680;
-    lut[8]   = 1.2272151; lut[9]   = 1.1885232; lut[10]  = 1.1606988;
-    lut[11]  = 1.1398000; lut[12]  = 1.1235677; lut[13]  = 1.1106196;
-    lut[14]  = 1.1000651; lut[15]  = 1.0913060; lut[16]  = 1.0839261;
-    lut[17]  = 1.0776276; lut[18]  = 1.0721920; lut[19]  = 1.0674553;
-    lut[20]  = 1.0632924; lut[25]  = 1.0483053; lut[30]  = 1.0390117;
-    lut[40]  = 1.0281339; lut[50]  = 1.0219834; lut[60]  = 1.0180339;
-    lut[70]  = 1.0152850; lut[80]  = 1.0132621; lut[90]  = 1.0117115;
-    lut[100] = 1.0104851; lut[150] = 1.0068808; lut[200] = 1.0051200;
-    lut[300] = 1.0033865; lut[500] = 1.0020191;
-
-  if (v<6) return(1.1) # ?? no idea - steve ??
-
-  if (v>500)
-  {
-    retval=1.0321/v + 1
-  }
-  else
-  {
-    lut.low=lut[1:floor(v)]
-    lut.high=lut[ceiling(v):length(lut)]
-
-    j.first=which(lut==min(lut.low, na.rm = T))
-    j.second=lut[j.first]
-
-    i.first=which(lut==max(lut.high, na.rm = T))
-    i.second=lut[i.first]
-
-    retval = (j.second - i.second)/(j.first - i.first)*(v - i.first) + j.second
-  }
-  return(retval^0.5)
-
-}
-
-#' Convert Z-score value to FWER corrected p-value
-#'
-#' https://github.com/spisakt/pTFCE
-#'
-#' @param resel_count resel count
-#' @param Z z-score value
-#'
-#' @details The Z-score value is converted to to p-value, corrected for multiple comparisons by controlling for famili-wise error rate
-#' The parameter resel_count is the number of resels (resolution elements) in the image, and can be obtained e.g by smoothest() (see examples).
-#'
-#' @return FWER-corrected p-value
 #'
 #' @export
 #'
 #' @examples
 #' \dontrun{
-#' s=smoothest(zmap, mask)
-#' fwe.z2p(resel_count=s$volume/s$resels, Z=2.3)
-#'
-#' pTFCE=ptfe(zmap, mask)
-#' fwe.z2p(pTFCE$number_of_resels, Z=3.1)
+#' # Standard bi-sided fMRI enhancement using 4D residuals for smoothness:
+#' res <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
+#'              residual = "res4d.nii.gz", dof = 42, sided = "two.sided")
+#' sig_map <- res$Z
+#' sig_map[abs(sig_map) < res$fwer0.05.Z] <- 0
 #' }
-fwe.z2p=function(resel_count, Z)
-{
-  # based on FSL
-  #the probability of a family wise error is approximately equiv- alent to the expected Euler Characteristic
-  if (Z<2)
-    p=1 # Below z of 2 E(EC) becomes non-monotonic
-  else
-    p = resel_count * 0.11694 * exp(-0.5*Z*Z)*(Z*Z-1)  #/* 0.11694 = (4ln2)^1.5 / (2pi)^2 */
-  return(min(p,1.0))
-}
+ptfce <- function(img,
+                  mask = NULL,
+                  Rd = NA,
+                  V = NA,
+                  resels = NA,
+                  residual = NULL,
+                  dof = NA,
+                  logpmin = 0,
+                  logpmax = NULL,
+                  ZestThr = 1.3,
+                  Nh = NULL,
+                  verbose = TRUE,
+                  sided = c("positive", "two.sided", "negative"),
+                  dh = 0.05,
+                  connectivity = 6L,
+                  fwe_p = 0.05,
+                  legacy = FALSE) {
+  sided <- match.arg(sided)
+  connectivity <- as.integer(connectivity)
+  if (length(connectivity) != 1L || !connectivity %in% c(6L, 18L, 26L)) {
+    stop("`connectivity` must be 6, 18, or 26.", call. = FALSE)
+  }
+  if (!is.numeric(ZestThr) || length(ZestThr) != 1L || !is.finite(ZestThr) || ZestThr <= 0) {
+    stop("`ZestThr` must be a positive finite scalar.", call. = FALSE)
+  }
 
-#' Get Z-score threshold for an FWER corrected p-value
-#'
-#' https://github.com/spisakt/pTFCE
-#'
-#' @param resel_count resel count
-#' @param FWEP FWER corrected p-value
-#'
-#' @details The p-value, corrected for multiple comparisons by controlling for family-wise error rate, is converted to a Z-score threshold.
-#' The parameter resel_count is the number of resels (resolution elements) in the image, and can be obtained e.g by smoothest() (see examples).
-#'
-#' @return Z-score threshold
-#'
-#' @export
-#'
-#' @examples
-#' \dontrun{
-#' s=smoothest(zmap, mask)
-#' fwe.p2z(resel_count=s$volume/s$resels, FWEP=0.05)
-#'
-#' pTFCE=ptfe(zmap, mask)
-#' fwe.p2z(pTFCE$number_of_resels, FWEP=0.05)
-#' }
-fwe.p2z=function(resel_count, FWEP=0.05)
-{
-  # based on FSL ptoz implementation
-  p=FWEP/(resel_count*0.11694) #/* (4ln2)^1.5 / (2pi)^2 */
+  img_meta <- read_volume_input(img, arg_name = "img", allow_4d = FALSE)
+  img_arr <- img_meta$data
+  d3 <- img_meta$dim3
 
-  #if (p<MINP) p=MINP;
+  if (is_missing_arg(mask)) {
+    mask_arr <- array(1.0, dim = d3)
+  } else {
+    mask_meta <- read_volume_input(mask, arg_name = "mask", allow_4d = FALSE)
+    if (!identical(mask_meta$dim3, d3)) {
+      stop(sprintf("`mask` dimensions (%s) do not match `img` dimensions (%s).",
+                   paste(mask_meta$dim3, collapse = "x"),
+                   paste(d3, collapse = "x")), call. = FALSE)
+    }
+    mask_arr <- mask_meta$data
+  }
 
-  if (p>0.5)
-    return(0)
-  else
-  {
-      l=2
-      u=100
-      z=0
-      while (u-l>0.001)
-      {
-        z=(u+l)/2
-        pp=exp(-0.5*z*z)*(z*z-1)
-        if (pp<p)
-          u=z
-        else
-          l=z
+  inside <- !is.na(mask_arr) & is.finite(mask_arr) & (mask_arr > 0.5)
+  if (!any(inside)) {
+    stop("`mask` contains zero active voxels (> 0.5).", call. = FALSE)
+  }
+
+  # Zero out-of-mask image values first so out-of-brain NAs/Infs (e.g. SPM outputs)
+  # neither trigger spurious warnings nor leak into connected components or logpmax.
+  img_arr[!inside] <- 0.0
+
+  in_mask_vals <- img_arr[inside]
+  if (any(is.na(in_mask_vals))) {
+    warning("NAs detected inside mask and replaced with zero!")
+    img_arr[inside & is.na(img_arr)] <- 0.0
+  }
+  if (any(is.infinite(img_arr[inside]))) {
+    warning("Infinite values detected inside mask and replaced with zero!")
+    img_arr[inside & is.infinite(img_arr)] <- 0.0
+  }
+
+  autosmooth <- FALSE
+  if (is_missing_arg(Rd) || is_missing_arg(V)) {
+    autosmooth <- TRUE
+    mask_clean <- array(as.numeric(inside), dim = d3)
+    if (!is_missing_arg(residual)) {
+      if (!is_missing_arg(dof)) {
+        smooth <- smoothest(residual, mask_clean, dof = dof, verbose = verbose)
+      } else {
+        warning("Residual supplied without `dof`: defaulting back to Z-score map smoothness estimation.")
+        smooth <- smoothest(img_arr, mask_clean, verbose = verbose)
+      }
+    } else {
+      smooth <- smoothest(img_arr, mask_clean, verbose = verbose)
+    }
+    V <- smooth$volume
+    Rd <- smooth$dLh * V
+    resels <- smooth$resels
+  } else {
+    V <- as.numeric(V)[1L]
+    Rd <- as.numeric(Rd)[1L]
+    if (!is.finite(V) || V <= 0 || !is.finite(Rd) || Rd <= 0) {
+      stop("`V` and `Rd` must be positive finite numbers.", call. = FALSE)
+    }
+  }
+
+  use_legacy <- isTRUE(legacy) || !is.null(Nh) || !is.null(logpmax)
+  in_vals <- img_arr[inside]
+  z_peak <- switch(
+    sided,
+    "positive" = max(in_vals),
+    "negative" = max(-in_vals),
+    "two.sided" = max(abs(in_vals))
+  )
+
+  if (use_legacy) {
+    Nh_eff <- if (is.null(Nh)) 100L else as.integer(Nh)[1L]
+    if (is.na(Nh_eff) || Nh_eff < 2L) {
+      stop("`Nh` must be an integer >= 2.", call. = FALSE)
+    }
+    if (is.null(logpmax)) {
+      logpmax_eff <- -stats::pnorm(z_peak, lower.tail = FALSE, log.p = TRUE)
+    } else {
+      logpmax_eff <- as.numeric(logpmax)[1L]
+    }
+    if (!is.finite(logpmax_eff) || logpmax_eff <= logpmin) {
+      logpmax_eff <- logpmin + 1e-6
+    }
+    logp_thres <- seq(logpmin, logpmax_eff, length.out = Nh_eff)
+    dh_legacy <- logp_thres[2L] - logp_thres[1L]
+    threshs <- stats::qnorm(-logp_thres, lower.tail = FALSE, log.p = TRUE)
+    if (logpmin == 0) {
+      threshs[1L] <- -9999999999
+    }
+    weights <- rep(1.0, Nh_eff)
+    analytical_subthr <- FALSE
+  } else {
+    if (!is.numeric(dh) || length(dh) != 1L || !is.finite(dh) || dh <= 0) {
+      stop("`dh` must be a positive finite number.", call. = FALSE)
+    }
+    x_zest <- -stats::pnorm(ZestThr, lower.tail = FALSE, log.p = TRUE)
+    x_max <- -stats::pnorm(z_peak, lower.tail = FALSE, log.p = TRUE)
+
+    if (!is.finite(x_max) || x_max <= x_zest) {
+      threshs <- numeric(0)
+      weights <- numeric(0)
+    } else {
+      # Fixed step `dh` across [x_zest, 100] (up to Z ~ 14), with bounded adaptive
+      # panels above 100 so extreme Z > 14 peaks never explode panel count.
+      x_fine_cap <- min(x_max, 100.0)
+      n_lo <- max(1L, as.integer(ceiling((x_fine_cap - x_zest) / dh)))
+      m_grid <- x_zest + (seq_len(n_lo) - 0.5) * dh
+      w_grid <- rep(dh, n_lo)
+      top_lo <- x_zest + n_lo * dh
+
+      if (x_max > top_lo) {
+        n_hi <- 200L
+        dh_hi <- (x_max - top_lo) / n_hi
+        m_hi <- top_lo + (seq_len(n_hi) - 0.5) * dh_hi
+        w_hi <- rep(dh_hi, n_hi)
+        m_grid <- c(m_grid, m_hi)
+        w_grid <- c(w_grid, w_hi)
+      }
+      threshs <- stats::qnorm(-m_grid, lower.tail = FALSE, log.p = TRUE)
+      weights <- w_grid
+    }
+    dh_legacy <- dh
+    analytical_subthr <- TRUE
+  }
+
+  if (verbose) {
+    cat(sprintf("* Performing pTFCE (%s)...\n", sided))
+  }
+
+  n_total <- length(img_arr)
+  p_arr <- rep(1.0, n_total)
+  logp_arr <- numeric(n_total)
+  Z_arr <- numeric(n_total)
+
+  run_single_tail <- function(tail_img) {
+    nlp <- ptfce_tail_cpp(
+      img = tail_img,
+      mask = inside,
+      nx = d3[1L],
+      ny = d3[2L],
+      nz = d3[3L],
+      V = V,
+      Rd = Rd,
+      threshs = threshs,
+      weights = weights,
+      dh_legacy = dh_legacy,
+      ZestThr = ZestThr,
+      connectivity = connectivity,
+      analytical_subthr = analytical_subthr
+    )
+    nlp
+  }
+
+  if (sided %in% c("positive", "negative")) {
+    work_img <- if (sided == "positive") img_arr else -img_arr
+    nlp <- run_single_tail(work_img)
+
+    if (use_legacy) {
+      logp_arr[inside] <- nlp[inside]
+      p_in <- exp(-nlp[inside])
+      p_in[p_in == 0] <- .Machine$double.xmin
+      p_in[p_in == 1] <- 1 - .Machine$double.neg.eps
+      p_arr[inside] <- p_in
+
+      z_in <- numeric(sum(inside))
+      pos_nlp <- nlp[inside] > 0
+      z_in[pos_nlp] <- stats::qnorm(-nlp[inside][pos_nlp], lower.tail = FALSE, log.p = TRUE)
+      z_in[!pos_nlp] <- stats::qnorm(1 - .Machine$double.neg.eps, lower.tail = FALSE)
+      Z_arr[inside] <- z_in
+    } else {
+      # Modern mode: exact analytical preservation for voxels <= ZestThr
+      sub_mask <- inside & (work_img <= ZestThr)
+      sup_mask <- inside & (work_img > ZestThr)
+
+      if (any(sub_mask)) {
+        w_sub <- work_img[sub_mask]
+        Z_arr[sub_mask] <- w_sub
+        logp_arr[sub_mask] <- -stats::pnorm(w_sub, lower.tail = FALSE, log.p = TRUE)
+        p_arr[sub_mask] <- stats::pnorm(w_sub, lower.tail = FALSE)
+      }
+      if (any(sup_mask)) {
+        nlp_sup <- nlp[sup_mask]
+        logp_arr[sup_mask] <- nlp_sup
+        p_sup <- exp(-nlp_sup)
+        p_sup[p_sup == 0] <- .Machine$double.xmin
+        p_arr[sup_mask] <- p_sup
+        Z_arr[sup_mask] <- stats::qnorm(-nlp_sup, lower.tail = FALSE, log.p = TRUE)
+      }
+    }
+  } else {
+    # Native bi-sided ("two.sided") mode
+    nlp_pos <- run_single_tail(img_arr)
+    nlp_neg <- run_single_tail(-img_arr)
+
+    pos_vox <- inside & (img_arr > 0)
+    neg_vox <- inside & (img_arr < 0)
+
+    if (use_legacy) {
+      if (any(pos_vox)) {
+        nlp <- nlp_pos[pos_vox]
+        z_p <- ifelse(nlp > 0, stats::qnorm(-nlp, lower.tail = FALSE, log.p = TRUE), -Inf)
+        z_p <- pmax(0.0, z_p)
+        Z_arr[pos_vox] <- z_p
+        lp2 <- pmax(0.0, nlp - log(2))
+        logp_arr[pos_vox] <- lp2
+        p2 <- exp(-lp2)
+        p2[p2 == 0] <- .Machine$double.xmin
+        p_arr[pos_vox] <- p2
+      }
+      if (any(neg_vox)) {
+        nlp <- nlp_neg[neg_vox]
+        z_n <- ifelse(nlp > 0, stats::qnorm(-nlp, lower.tail = FALSE, log.p = TRUE), -Inf)
+        z_n <- pmax(0.0, z_n)
+        Z_arr[neg_vox] <- -z_n
+        lp2 <- pmax(0.0, nlp - log(2))
+        logp_arr[neg_vox] <- lp2
+        p2 <- exp(-lp2)
+        p2[p2 == 0] <- .Machine$double.xmin
+        p_arr[neg_vox] <- p2
+      }
+    } else {
+      # Modern bi-sided mode: exact identity on [-ZestThr, ZestThr], smooth boost beyond
+      sub_vox <- inside & (abs(img_arr) <= ZestThr) & (img_arr != 0)
+      if (any(sub_vox)) {
+        z_sub <- img_arr[sub_vox]
+        Z_arr[sub_vox] <- z_sub
+        nlp_1s <- -stats::pnorm(abs(z_sub), lower.tail = FALSE, log.p = TRUE)
+        lp2 <- pmax(0.0, nlp_1s - log(2))
+        logp_arr[sub_vox] <- lp2
+        p_arr[sub_vox] <- exp(-lp2)
       }
 
+      pos_sup <- inside & (img_arr > ZestThr)
+      if (any(pos_sup)) {
+        nlp <- nlp_pos[pos_sup]
+        Z_arr[pos_sup] <- stats::qnorm(-nlp, lower.tail = FALSE, log.p = TRUE)
+        lp2 <- pmax(0.0, nlp - log(2))
+        logp_arr[pos_sup] <- lp2
+        p2 <- exp(-lp2)
+        p2[p2 == 0] <- .Machine$double.xmin
+        p_arr[pos_sup] <- p2
+      }
+
+      neg_sup <- inside & (img_arr < -ZestThr)
+      if (any(neg_sup)) {
+        nlp <- nlp_neg[neg_sup]
+        Z_arr[neg_sup] <- -stats::qnorm(-nlp, lower.tail = FALSE, log.p = TRUE)
+        lp2 <- pmax(0.0, nlp - log(2))
+        logp_arr[neg_sup] <- lp2
+        p2 <- exp(-lp2)
+        p2[p2 == 0] <- .Machine$double.xmin
+        p_arr[neg_sup] <- p2
+      }
+    }
   }
-  return(z)
+
+  # Compute GRF FWER thresholds
+  if (autosmooth || !is_missing_arg(resels)) {
+    resels_val <- as.numeric(resels)[1L]
+    number_of_resels <- V / resels_val
+    alpha_scale <- if (sided == "two.sided") 0.5 else 1.0
+    fwer0.05.Z <- fwe.p2z(number_of_resels, 0.05 * alpha_scale)
+    fwe_Z <- stats::setNames(
+      fwe.p2z(number_of_resels, fwe_p * alpha_scale),
+      format(fwe_p, trim = TRUE)
+    )
+  } else {
+    warning("For GRF-based FWER correction, please specify `resels` or allow automatic smoothness estimation.")
+    number_of_resels <- NA_real_
+    fwer0.05.Z <- NA_real_
+    fwe_Z <- stats::setNames(rep(NA_real_, length(fwe_p)), format(fwe_p, trim = TRUE))
+  }
+
+  out <- list(
+    p = wrap_volume_output(p_arr, img_meta),
+    logp = wrap_volume_output(logp_arr, img_meta),
+    Z = wrap_volume_output(Z_arr, img_meta),
+    number_of_resels = number_of_resels,
+    fwer0.05.Z = fwer0.05.Z,
+    fwe.Z = fwe_Z,
+    sided = sided
+  )
+  class(out) <- "ptfce"
+  out
 }
 
+#' @export
+print.ptfce <- function(x, ...) {
+  cat("pTFCE result (", x$sided, ")\n", sep = "")
+  cat("  Number of resels : ", format(x$number_of_resels, digits = 5), "\n", sep = "")
+  cat("  FWER 0.05 Z-thr  : ", format(x$fwer0.05.Z, digits = 5), "\n", sep = "")
+  invisible(x)
+}
+
+#' Convert a Student's t-statistic image or vector to Z-scores in log-space
+#'
+#' Accurately maps t-statistics with \code{dof} degrees of freedom to standard
+#' normal Z-scores without overflow at extreme t-values (\code{|t| >> 15}).
+#'
+#' @param img A numeric vector, array, \code{RNifti} image, \code{oro.nifti} object,
+#'   or NIfTI file path containing t-statistics.
+#' @param dof Positive degrees of freedom.
+#'
+#' @return Z-score object of the same class and dimensions as \code{img}.
+#' @export
+t2z <- function(img, dof) {
+  if (!is.numeric(dof) || length(dof) != 1L || !is.finite(dof) || dof <= 0) {
+    stop("`dof` must be a positive finite number.", call. = FALSE)
+  }
+  if (is.numeric(img) && is.null(dim(img))) {
+    sgn <- sign(img)
+    lp <- stats::pt(abs(img), df = dof, lower.tail = FALSE, log.p = TRUE)
+    z <- -stats::qnorm(lp, lower.tail = TRUE, log.p = TRUE) * sgn
+    z[img == 0] <- 0
+    return(z)
+  }
+  meta <- read_volume_input(img, arg_name = "img", allow_4d = TRUE)
+  arr <- meta$data
+  sgn <- sign(arr)
+  lp <- stats::pt(abs(arr), df = dof, lower.tail = FALSE, log.p = TRUE)
+  z_arr <- -stats::qnorm(lp, lower.tail = TRUE, log.p = TRUE) * sgn
+  z_arr[arr == 0] <- 0
+  if (meta$nt > 1L) {
+    dim(z_arr) <- meta$orig_dim
+    if (identical(meta$kind, "rnifti")) {
+      return(RNifti::updateNifti(z_arr, template = meta$template))
+    }
+    return(z_arr)
+  }
+  wrap_volume_output(z_arr, meta)
+}
+
+# Helper functions
+
+#' Aggregate logpvals by equidistant incremental logarithmic probability aggregation
+#'
+#' @param logpvals Vector of enhanced \code{-log(p)} values across thresholds.
+#' @param d Step size \code{delta -log(p)}.
+#'
+#' @return Aggregated \code{-log(p)} value.
+#' @export
+aggregate_logpvals <- function(logpvals, d) {
+  logpvals[is.infinite(logpvals) & logpvals > 0] <- 745
+  s <- max(0, sum(logpvals))
+  0.5 * (sqrt(d * (8 * s + d)) - d)
+}
+
+#' Expected cluster size at threshold h in image of volume V with roughness-volume Rd
+#'
+#' Ported from FSL Gaussian Random Field cluster theory.
+#'
+#' @param h Z-score cluster-forming threshold(s).
+#' @param V Number of voxels in mask.
+#' @param Rd Roughness-volume product (\code{dLh * V}).
+#'
+#' @return Expected value of cluster size in voxels.
+#' @export
+Es <- function(h, V, Rd) {
+  es_cpp(as.numeric(h), as.numeric(V)[1L], as.numeric(Rd)[1L])
+}
+
+dvox <- function(h) {
+  stats::dnorm(h)
+}
+
+pvox <- function(h) {
+  stats::pnorm(h, lower.tail = FALSE)
+}
+
+dclust <- function(h, V, Rd, c, ZestThr = 1.3, CONST = 1) {
+  if (length(c) == 1L && is.na(c)) {
+    return(dvox(h))
+  }
+  h_num <- as.numeric(h)
+  lam <- (Es(h_num, V, Rd) / gamma(2.5))^(-2 / 3)
+  log_d <- log(lam) - lam * (c^(2 / 3)) + log(CONST)
+  out <- exp(log_d)
+  out[h_num < ZestThr] <- 0
+  out
+}
+
+dvox.clust <- function(h, V, Rd, c, ZestThr = 1.3) {
+  if (length(c) == 1L && is.na(c)) {
+    return(dvox(h))
+  }
+  dvox_clust_cpp(as.numeric(h), as.numeric(V)[1L], as.numeric(Rd)[1L], as.numeric(c)[1L], ZestThr)
+}
+
+pvox.clust <- function(V, Rd, c, actH, ZestThr = 1.3) {
+  nlp <- neglog_pvox_clust_cpp(
+    as.numeric(V)[1L],
+    as.numeric(Rd)[1L],
+    as.numeric(c),
+    as.numeric(actH),
+    as.numeric(ZestThr)[1L]
+  )
+  p <- exp(-nlp)
+  p[p == 0] <- .Machine$double.xmin
+  p
+}
+
+#' Estimate global image smoothness
+#'
+#' Fast C++ port of FSL's \code{smoothest} tool (Jenkinson, FMRIB Tech Report TR00DF1)
+#' supporting both 2D/3D Z-score maps and 4D GLM residual time-series images.
+#'
+#' @param img A 2D/3D Z-score image or 4D residual image (\code{RNifti}, \code{oro.nifti},
+#'   \code{array}, or file path).
+#' @param mask Spatial mask image (\code{RNifti}, \code{oro.nifti}, \code{array}, or file path).
+#' @param dof Residual degrees of freedom (required when \code{img} is a 4D residual image).
+#' @param verbose Logical; print diagnostic messages if \code{TRUE} (default).
+#'
+#' @return A list containing:
+#' \itemize{
+#'   \item \strong{volume}: Mask volume in voxels.
+#'   \item \strong{sigmasq}: Estimated Gaussian smoothness variance in x, y, z (voxels^2).
+#'   \item \strong{FWHM}: Full-width at half-maximum in x, y, z (voxels).
+#'   \item \strong{dLh}: Determinant of \eqn{\Lambda^{1/2}} (\code{voxels^-3}).
+#'   \item \strong{resels}: Resel size in voxels per resel.
+#' }
+#' @export
+smoothest <- function(img, mask, dof = NA, verbose = TRUE) {
+  if (verbose) cat("* Estimating smoothness based on the data...\n")
+
+  img_meta <- read_volume_input(img, arg_name = "img", allow_4d = TRUE)
+  d3 <- img_meta$dim3
+  nt <- img_meta$nt
+
+  if (nt > 1L && is_missing_arg(dof)) {
+    stop("`dof` must be provided when estimating smoothness from a 4D residual image.", call. = FALSE)
+  }
+
+  mask_meta <- read_volume_input(mask, arg_name = "mask", allow_4d = FALSE)
+  if (!identical(mask_meta$dim3, d3)) {
+    stop(sprintf("`mask` dimensions (%s) do not match `img` spatial dimensions (%s).",
+                 paste(mask_meta$dim3, collapse = "x"),
+                 paste(d3, collapse = "x")), call. = FALSE)
+  }
+
+  if (d3[3L] <= 1L) {
+    warning("Using 2D image mode.")
+  }
+
+  cpp_res <- smoothest_cpp(
+    img = img_meta$data,
+    mask = mask_meta$data,
+    nx = d3[1L],
+    ny = d3[2L],
+    nz = d3[3L],
+    nt = nt
+  )
+
+  usez <- cpp_res$usez
+  SSminus <- cpp_res$SSminus
+  S2 <- cpp_res$S2
+
+  if (cpp_res$N <= 0) {
+    stop("Mask contains too few contiguous interior voxels to estimate spatial smoothness.", call. = FALSE)
+  }
+
+  if (nt > 1L && verbose) {
+    v <- as.numeric(dof)[1L]
+    cat(sprintf("  Non-edge voxels = %.0f, (dof - 2)/(dof - 1) = %.6f\n",
+                cpp_res$N, (v - 2) / (v - 1)))
+  }
+
+  axes <- c("X", "Y", "Z")
+  n_axes <- if (usez) 3L else 2L
+  for (ax in seq_len(n_axes)) {
+    if (SSminus[ax] >= 0.99999999 * S2[ax]) {
+      SSminus[ax] <- 0.99999 * S2[ax]
+      warning(sprintf("Extreme smoothness detected in %s - possibly biased global estimate.", axes[ax]))
+    }
+  }
+
+  sigmasq <- c(x = NA_real_, y = NA_real_, z = NA_real_)
+  sigmasq[1L] <- -1.0 / (4.0 * log(abs(SSminus[1L] / S2[1L])))
+  sigmasq[2L] <- -1.0 / (4.0 * log(abs(SSminus[2L] / S2[2L])))
+  sigmasq[3L] <- if (usez) -1.0 / (4.0 * log(abs(SSminus[3L] / S2[3L]))) else 0.0
+
+  if (usez) {
+    dLh <- ((sigmasq[1L] * sigmasq[2L] * sigmasq[3L])^-0.5) * (8.0^-0.5)
+  } else {
+    dLh <- ((sigmasq[1L] * sigmasq[2L])^-0.5) * (4.0^-0.5)
+  }
+
+  if (nt > 1L) {
+    dLh <- dLh * interpolate(as.numeric(dof)[1L])
+  }
+
+  FWHM <- c(
+    x = sqrt(8.0 * log(2.0) * sigmasq[1L]),
+    y = sqrt(8.0 * log(2.0) * sigmasq[2L]),
+    z = if (usez) sqrt(8.0 * log(2.0) * sigmasq[3L]) else 0.0
+  )
+
+  resels <- FWHM[1L] * FWHM[2L] * (if (usez) FWHM[3L] else 1.0)
+
+  list(
+    volume = cpp_res$volume,
+    sigmasq = sigmasq,
+    FWHM = FWHM,
+    dLh = unname(dLh),
+    resels = unname(resels)
+  )
+}
+
+interpolate <- function(v) {
+  knots <- c(5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20,
+             25, 30, 40, 50, 60, 70, 80, 90, 100, 150, 200, 300, 500)
+  vals <- c(1.5423138, 1.3757105, 1.2842680, 1.2272151, 1.1885232, 1.1606988,
+            1.1398000, 1.1235677, 1.1106196, 1.1000651, 1.0913060, 1.0839261,
+            1.0776276, 1.0721920, 1.0674553, 1.0632924, 1.0483053, 1.0390117,
+            1.0281339, 1.0219834, 1.0180339, 1.0152850, 1.0132621, 1.0117115,
+            1.0104851, 1.0068808, 1.0051200, 1.0033865, 1.0020191)
+
+  if (v < 5) return(1.1)
+  if (v > 500) {
+    retval <- 1.0321 / v + 1.0
+  } else {
+    retval <- stats::approx(x = knots, y = vals, xout = v)$y
+  }
+  retval^0.5
+}
+
+#' Convert Z-score value(s) to GRF FWER-corrected p-value(s)
+#'
+#' Uses the 3D Gaussian Random Field Expected Euler Characteristic approximation.
+#' Vectorized over \code{Z} and \code{resel_count}.
+#'
+#' @param resel_count Number of resels in the search volume (\code{volume / resels}).
+#' @param Z Numeric vector of Z-score values.
+#'
+#' @return Numeric vector of FWER-corrected p-values in \code{[0, 1]}.
+#' @export
+fwe.z2p <- function(resel_count, Z) {
+  ec_const <- 0.11694 # (4 * ln(2))^1.5 / (2 * pi)^2 (FSL convention)
+  df <- data.frame(r = as.numeric(resel_count), z = as.numeric(Z))
+  out <- rep(1.0, nrow(df))
+  na_idx <- is.na(df$r) | is.na(df$z)
+  out[na_idx] <- NA_real_
+
+  ok <- !na_idx & (df$z >= 2.0)
+  if (any(ok)) {
+    z_ok <- df$z[ok]
+    log_p <- log(df$r[ok]) + log(ec_const) - 0.5 * z_ok * z_ok + log(z_ok * z_ok - 1.0)
+    out[ok] <- pmin(1.0, exp(log_p))
+  }
+  out
+}
+
+#' Compute GRF FWER-corrected Z-score threshold(s) from p-value(s)
+#'
+#' Uses Newton-Raphson in log-space to invert the 3D Expected Euler Characteristic
+#' FWER approximation accurately across arbitrary \code{FWEP} and \code{resel_count}.
+#' Vectorized over \code{FWEP} and \code{resel_count}.
+#'
+#' @param resel_count Number of resels in the search volume (\code{volume / resels}).
+#' @param FWEP Numeric vector of target FWER-corrected p-values (default: \code{0.05}).
+#'
+#' @return Numeric vector of Z-score thresholds.
+#' @export
+fwe.p2z <- function(resel_count, FWEP = 0.05) {
+  ec_const <- 0.11694 # (4 * ln(2))^1.5 / (2 * pi)^2 (FSL convention)
+  df <- data.frame(r = as.numeric(resel_count), fwep = as.numeric(FWEP))
+  out <- numeric(nrow(df))
+
+  for (i in seq_len(nrow(df))) {
+    r <- df$r[i]
+    fwep <- df$fwep[i]
+    if (is.na(r) || is.na(fwep) || r <= 0 || fwep <= 0) {
+      out[i] <- NA_real_
+      next
+    }
+    log_target <- log(fwep) - log(r) - log(ec_const)
+    # At z = 2, log(z^2 - 1) - 0.5*z^2 = log(3) - 2 = -0.9013877; FSL returns 0 for p > 0.5
+    if (log_target > log(0.5)) {
+      out[i] <- 0.0
+      next
+    }
+    if (log_target >= log(3.0) - 2.0) {
+      out[i] <- 2.0
+      next
+    }
+
+    # Solve g(z) = log(z^2 - 1) - 0.5 * z^2 - log_target = 0 for z > 2
+    # g'(z) = 2*z / (z^2 - 1) - z = -z * (z^2 - 3) / (z^2 - 1)
+    # Note g(z) has maximum at z = sqrt(3) < 2 and is strictly decreasing & concave for z > 2!
+    z <- max(2.1, sqrt(-2.0 * log_target + 2.0 * log(max(2.0, -2.0 * log_target))))
+    for (it in 1:30) {
+      z2 <- z * z
+      g <- log(z2 - 1.0) - 0.5 * z2 - log_target
+      gp <- (2.0 * z) / (z2 - 1.0) - z
+      step <- g / gp
+      z_new <- max(2.0000001, z - step)
+      if (abs(z_new - z) <= 1e-13 * z_new) {
+        z <- z_new
+        break
+      }
+      z <- z_new
+    }
+    out[i] <- z
+  }
+  out
+}
