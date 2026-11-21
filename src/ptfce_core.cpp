@@ -1083,3 +1083,1181 @@ List smoothest_cpp(NumericVector img, NumericVector mask,
     Named("voxel_weights") = voxel_weights
   );
 }
+
+namespace {
+
+// Solve for L2-unit 1D Gaussian kernel whose discrete lag-1 autocorrelation matches
+// exp(-1 / (4 * target_sigmasq)), ensuring exact unit variance and target roughness
+// across all smoothness regimes (from sub-voxel to ultra-smooth).
+void solve_discrete_kernel_1d(double target_sigmasq, int axis_len,
+                              std::vector<double> &kern, int &rad) {
+  if (axis_len <= 1 || !std::isfinite(target_sigmasq) || target_sigmasq <= 1e-4) {
+    rad = 0;
+    kern.assign(1, 1.0);
+    return;
+  }
+  double rho_target = std::exp(-1.0 / (4.0 * target_sigmasq));
+  if (rho_target <= 1e-7) {
+    rad = 0;
+    kern.assign(1, 1.0);
+    return;
+  }
+  rho_target = std::min(0.99995, rho_target);
+
+  auto eval_rho = [](double s) -> double {
+    int r = std::max(1, std::min(128, static_cast<int>(std::ceil(4.0 * s + 1.0))));
+    double inv_s2 = 1.0 / (s * s);
+    double s0 = 1.0;
+    double s1 = 0.0;
+    double w_prev = 1.0; // m = 0
+    for (int m = 1; m <= r; ++m) {
+      double wm = std::exp(-0.5 * static_cast<double>(m * m) * inv_s2);
+      s0 += 2.0 * wm * wm;
+      s1 += 2.0 * wm * w_prev;
+      w_prev = wm;
+    }
+    return s1 / s0;
+  };
+
+  double s_lo = 0.05;
+  double s_hi = std::max(2.0 * std::sqrt(target_sigmasq) + 2.0, 4.0);
+  while (s_hi < 64.0 && eval_rho(s_hi) < rho_target) {
+    s_hi *= 2.0;
+  }
+  for (int it = 0; it < 42; ++it) {
+    double mid = 0.5 * (s_lo + s_hi);
+    if (eval_rho(mid) < rho_target) {
+      s_lo = mid;
+    } else {
+      s_hi = mid;
+    }
+  }
+  double s_star = 0.5 * (s_lo + s_hi);
+  rad = std::max(1, std::min(128, static_cast<int>(std::ceil(3.75 * s_star))));
+  kern.resize(2 * rad + 1);
+  double inv_s2 = 1.0 / (s_star * s_star);
+  double l2_sq = 0.0;
+  for (int m = -rad; m <= rad; ++m) {
+    double wm = std::exp(-0.5 * static_cast<double>(m * m) * inv_s2);
+    kern[m + rad] = wm;
+    l2_sq += wm * wm;
+  }
+  double inv_l2 = 1.0 / std::sqrt(l2_sq);
+  for (double &wm : kern) wm *= inv_l2;
+}
+
+// Convolve 3D white-noise array `w_pad` of dims (px, py, pz) centered around a bounding box
+// of dims (bx, by, bz) having symmetric padding (pad_x, pad_y, pad_z) >= (rad_x, rad_y, rad_z),
+// writing unit-variance output into `out_bbox` of size bx * by * bz.
+void convolve_padded_bbox_3d(const std::vector<double> &w_pad,
+                             int px, int py, int pz,
+                             int pad_x, int pad_y, int pad_z,
+                             int bx, int by, int bz,
+                             const std::vector<double> &kx, int rx,
+                             const std::vector<double> &ky, int ry,
+                             const std::vector<double> &kz, int rz,
+                             std::vector<double> &buf1,
+                             std::vector<double> &buf2,
+                             std::vector<double> &out_bbox) {
+  const int pxy = px * py;
+  const int y_keep = by + 2 * rz; // wait: keep full py in pass 1, reduce to by in pass 2, bz in pass 3
+  (void)y_keep;
+
+  // Pass X: (px, py, pz) -> buf1 of (bx, py, pz) using z in [pad_z - rz, pad_z + bz - 1 + rz],
+  // y in [pad_y - ry, pad_y + by - 1 + ry]
+  const int wy = by + 2 * ry;
+  const int wz = bz + 2 * rz;
+  const int y0 = pad_y - ry;
+  const int z0 = pad_z - rz;
+
+  buf1.resize(static_cast<size_t>(bx) * wy * wz);
+  for (int z = 0; z < wz; ++z) {
+    int zp = z0 + z;
+    for (int y = 0; y < wy; ++y) {
+      int yp = y0 + y;
+      const double *src_row = &w_pad[static_cast<size_t>(zp) * pxy + yp * px + pad_x];
+      double *dst_row = &buf1[(static_cast<size_t>(z) * wy + y) * bx];
+      if (rx == 0) {
+        std::copy(src_row, src_row + bx, dst_row);
+      } else {
+        for (int x = 0; x < bx; ++x) {
+          double acc = 0.0;
+          const double *s = src_row + x - rx;
+          for (int k = 0; k <= 2 * rx; ++k) {
+            acc += kx[k] * s[k];
+          }
+          dst_row[x] = acc;
+        }
+      }
+    }
+  }
+
+  // Pass Y: buf1 (bx, wy, wz) -> buf2 (bx, by, wz)
+  buf2.resize(static_cast<size_t>(bx) * by * wz);
+  for (int z = 0; z < wz; ++z) {
+    const double *src_slice = &buf1[static_cast<size_t>(z) * wy * bx];
+    double *dst_slice = &buf2[static_cast<size_t>(z) * by * bx];
+    if (ry == 0) {
+      std::copy(src_slice, src_slice + static_cast<size_t>(bx) * by, dst_slice);
+    } else {
+      for (int y = 0; y < by; ++y) {
+        double *dst_row = dst_slice + y * bx;
+        std::fill(dst_row, dst_row + bx, 0.0);
+        for (int k = 0; k <= 2 * ry; ++k) {
+          const double wk = ky[k];
+          const double *src_row = src_slice + (y + k) * bx;
+          for (int x = 0; x < bx; ++x) {
+            dst_row[x] += wk * src_row[x];
+          }
+        }
+      }
+    }
+  }
+
+  // Pass Z: buf2 (bx, by, wz) -> out_bbox (bx, by, bz)
+  const size_t n_bxy = static_cast<size_t>(bx) * by;
+  out_bbox.resize(n_bxy * bz);
+  if (rz == 0) {
+    std::copy(buf2.begin(), buf2.begin() + n_bxy * bz, out_bbox.begin());
+  } else {
+    for (int z = 0; z < bz; ++z) {
+      double *dst_slice = &out_bbox[static_cast<size_t>(z) * n_bxy];
+      std::fill(dst_slice, dst_slice + n_bxy, 0.0);
+      for (int k = 0; k <= 2 * rz; ++k) {
+        const double wk = kz[k];
+        const double *src_slice = &buf2[static_cast<size_t>(z + k) * n_bxy];
+        for (size_t i = 0; i < n_bxy; ++i) {
+          dst_slice[i] += wk * src_slice[i];
+        }
+      }
+    }
+  }
+}
+
+// Fast reusable workspace and lazy 2D posterior LUT for computing max(enhanced Z)
+// across hundreds of null replicates without numerical quadrature or heap churn inside the loop.
+class NullPtfceEngine {
+public:
+  int nx, ny, nz, n, nxy;
+  double V, Rd, logV, logRd, ZestThr, x_zest, base_acc_zest;
+  int connectivity;
+  int sided_mode; // 0 = positive, 1 = negative, 2 = two.sided
+  bool use_nonstat;
+  bool use_legacy;
+  int Nh_eff;
+  double logpmin, logpmax_fixed, dh;
+
+  LogicalVector mask_r;
+  Nullable<NumericVector> vw_nullable;
+  std::vector<int> mask_idx;
+  std::vector<double> vw_vec;
+  std::vector<int> dx, dy, dz;
+  int n_nb;
+
+  // Modern fixed-dh grid and lazy 2D posterior LUT
+  std::vector<double> threshs;
+  std::vector<double> weights;
+  double top_x_grid;
+
+  enum { SMALL_C_MAX = 64, N_C_LUT = 96 };
+  double s_min, s_max, ds_lut, inv_ds_lut;
+  std::vector<double> small_den; // [1 .. SMALL_C_MAX]
+  std::vector<double> lut_den;   // [0 .. N_C_LUT - 1]
+  std::vector<unsigned char> row_ready;
+  std::vector<double> small_step_lut; // row_hi * (SMALL_C_MAX + 1) + c
+  std::vector<double> cubic_step_lut; // row_hi * N_C_LUT + g
+
+  // Reusable Union-Find buffers (reset selectively in O(|order|))
+  std::vector<int> order;
+  std::vector<int> parent;
+  std::vector<int> comp_sz;
+  std::vector<double> comp_mass;
+  std::vector<double> root_step;
+  std::vector<double> accum;
+
+  NullPtfceEngine(const LogicalVector &mask_,
+                  int nx_, int ny_, int nz_,
+                  double V_, double Rd_, double ZestThr_,
+                  int connectivity_, int sided_mode_,
+                  bool use_legacy_, int Nh_eff_,
+                  double logpmin_, double logpmax_fixed_, double dh_,
+                  Nullable<NumericVector> voxel_weights_)
+      : nx(nx_), ny(ny_), nz(nz_), n(nx_ * ny_ * nz_), nxy(nx_ * ny_),
+        V(V_), Rd(Rd_), logV(std::log(V_)), logRd(std::log(Rd_)),
+        ZestThr(ZestThr_),
+        x_zest(-R::pnorm5(ZestThr_, 0.0, 1.0, 0, 1)),
+        base_acc_zest(0.5 * x_zest * x_zest),
+        connectivity(connectivity_), sided_mode(sided_mode_),
+        use_nonstat(voxel_weights_.isNotNull()),
+        use_legacy(use_legacy_), Nh_eff(Nh_eff_),
+        logpmin(logpmin_), logpmax_fixed(logpmax_fixed_), dh(dh_),
+        mask_r(mask_), vw_nullable(voxel_weights_),
+        parent(n, -1), comp_sz(n, 0), accum(n, 0.0) {
+
+    mask_idx.reserve(n / 2 + 16);
+    for (int i = 0; i < n; ++i) {
+      if (mask_r[i]) mask_idx.push_back(i);
+    }
+
+    if (use_nonstat) {
+      NumericVector vw_r(voxel_weights_);
+      vw_vec.assign(n, 0.0);
+      comp_mass.assign(n, 0.0);
+      double c_min = 1e30, c_max = 0.0;
+      for (int idx : mask_idx) {
+        double wi = std::max(1e-4, static_cast<double>(vw_r[idx]));
+        vw_vec[idx] = wi;
+        if (wi < c_min) c_min = wi;
+        c_max += wi;
+      }
+      if (c_max <= c_min) c_max = c_min * 2.0;
+      s_min = std::log(c_min * 0.95);
+      s_max = std::log(c_max * 1.05 + 1.0);
+    } else {
+      s_min = std::log(static_cast<double>(SMALL_C_MAX) * 0.95);
+      s_max = std::log(std::max(static_cast<double>(SMALL_C_MAX) * 2.0, V * 1.05 + 2.0));
+    }
+    ds_lut = (s_max - s_min) / static_cast<double>(N_C_LUT - 1);
+    inv_ds_lut = 1.0 / ds_lut;
+
+    root_step.assign(n, 0.0);
+    order.reserve(mask_idx.size() / 4 + 32);
+
+    for (int oz = -1; oz <= 1; ++oz) {
+      for (int oy = -1; oy <= 1; ++oy) {
+        for (int ox = -1; ox <= 1; ++ox) {
+          int manhattan = std::abs(ox) + std::abs(oy) + std::abs(oz);
+          if (manhattan == 0) continue;
+          if (connectivity == 6 && manhattan > 1) continue;
+          if (connectivity == 18 && manhattan > 2) continue;
+          dx.push_back(ox);
+          dy.push_back(oy);
+          dz.push_back(oz);
+        }
+      }
+    }
+    n_nb = static_cast<int>(dx.size());
+
+    if (!use_legacy) {
+      // Precompute normalizing denominators log_den once
+      if (!use_nonstat) {
+        small_den.assign(SMALL_C_MAX + 1, 0.0);
+        for (int c = 1; c <= SMALL_C_MAX; ++c) {
+          double c23 = std::pow(static_cast<double>(c), 2.0 / 3.0);
+          small_den[c] = log_integral_tail(ZestThr, logV, logRd, c23);
+        }
+      }
+      lut_den.assign(N_C_LUT, 0.0);
+      for (int g = 0; g < N_C_LUT; ++g) {
+        double s = s_min + g * ds_lut;
+        double c23 = std::exp((2.0 / 3.0) * s);
+        lut_den[g] = log_integral_tail(ZestThr, logV, logRd, c23);
+      }
+      top_x_grid = x_zest;
+      extend_modern_grid_to(30.0); // initially cover up to -log(p) = 30 (Z ~ 7.4)
+    }
+  }
+
+  void extend_modern_grid_to(double x_max) {
+    if (x_max <= top_x_grid) return;
+    // Rebuild modern grid up to max(x_max + 2.0, top_x_grid) using exact ptfce() rule
+    double target_x = std::max(x_max + 2.0, 30.0);
+    std::vector<double> new_m;
+    std::vector<double> new_w;
+
+    double x_fine_cap = std::min(target_x, 100.0);
+    int n_lo = std::max(1, static_cast<int>(std::ceil((x_fine_cap - x_zest) / dh)));
+    new_m.reserve(n_lo + 205);
+    new_w.reserve(n_lo + 205);
+    for (int i = 1; i <= n_lo; ++i) {
+      new_m.push_back(x_zest + (static_cast<double>(i) - 0.5) * dh);
+      new_w.push_back(dh);
+    }
+    double top_lo = x_zest + n_lo * dh;
+    if (target_x > top_lo) {
+      const int n_hi = 200;
+      double dh_hi = (target_x - top_lo) / static_cast<double>(n_hi);
+      for (int i = 1; i <= n_hi; ++i) {
+        new_m.push_back(top_lo + (static_cast<double>(i) - 0.5) * dh_hi);
+        new_w.push_back(dh_hi);
+      }
+    }
+
+    int old_nth = static_cast<int>(threshs.size());
+    int new_nth = static_cast<int>(new_m.size());
+    // Note: if previous grid stayed <= 100.0, all existing prefix points are identical!
+    bool prefix_identical = (top_x_grid <= 100.0) && (old_nth <= new_nth);
+
+    threshs.resize(new_nth);
+    weights = new_w;
+    int start_conv = prefix_identical ? old_nth : 0;
+    for (int i = start_conv; i < new_nth; ++i) {
+      threshs[i] = R::qnorm5(-new_m[i], 0.0, 1.0, 0, 1);
+    }
+
+    if (prefix_identical) {
+      row_ready.resize(new_nth, 0);
+      if (!use_nonstat) {
+        small_step_lut.resize(static_cast<size_t>(new_nth) * (SMALL_C_MAX + 1), 0.0);
+      }
+      cubic_step_lut.resize(static_cast<size_t>(new_nth) * N_C_LUT, 0.0);
+    } else {
+      row_ready.assign(new_nth, 0);
+      if (!use_nonstat) {
+        small_step_lut.assign(static_cast<size_t>(new_nth) * (SMALL_C_MAX + 1), 0.0);
+      }
+      cubic_step_lut.assign(static_cast<size_t>(new_nth) * N_C_LUT, 0.0);
+    }
+    top_x_grid = new_m.back() + 0.5 * new_w.back();
+  }
+
+  inline void ensure_lut_row(int hi) {
+    if (row_ready[hi]) return;
+    double h = threshs[hi];
+    double w = weights[hi];
+    if (!use_nonstat) {
+      double *s_row = &small_step_lut[static_cast<size_t>(hi) * (SMALL_C_MAX + 1)];
+      for (int c = 1; c <= SMALL_C_MAX; ++c) {
+        double c23 = std::pow(static_cast<double>(c), 2.0 / 3.0);
+        s_row[c] = w * neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c23, small_den[c]);
+      }
+    }
+    double *c_row = &cubic_step_lut[static_cast<size_t>(hi) * N_C_LUT];
+    for (int g = 0; g < N_C_LUT; ++g) {
+      double s = s_min + g * ds_lut;
+      double c23 = std::exp((2.0 / 3.0) * s);
+      c_row[g] = w * neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c23, lut_den[g]);
+    }
+    row_ready[hi] = 1;
+  }
+
+  inline double interp_row_cubic(int hi, double log_cm) const {
+    const double *y = &cubic_step_lut[static_cast<size_t>(hi) * N_C_LUT];
+    double u = (log_cm - s_min) * inv_ds_lut;
+    if (u <= 0.0) return y[0];
+    if (u >= static_cast<double>(N_C_LUT - 1)) return y[N_C_LUT - 1];
+    int i1 = static_cast<int>(std::floor(u));
+    if (i1 < 1) i1 = 1;
+    if (i1 > N_C_LUT - 3) i1 = N_C_LUT - 3;
+    double t = u - static_cast<double>(i1);
+    double w0 = -t * (t - 1.0) * (t - 2.0) * (1.0 / 6.0);
+    double w1 =  (t + 1.0) * (t - 1.0) * (t - 2.0) * 0.5;
+    double w2 = -(t + 1.0) * t * (t - 2.0) * 0.5;
+    double w3 =  (t + 1.0) * t * (t - 1.0) * (1.0 / 6.0);
+    return std::max(0.0, w0 * y[i1 - 1] + w1 * y[i1] + w2 * y[i1 + 1] + w3 * y[i1 + 2]);
+  }
+
+  inline int find_root(int x) {
+    int r = x;
+    while (parent[r] != r) r = parent[r];
+    while (x != r) {
+      int nxt = parent[x];
+      parent[x] = r;
+      x = nxt;
+    }
+    return r;
+  }
+
+  // Evaluate max enhanced Z on a single tail (`sign_mult` = +1.0 for positive tail, -1.0 for negative tail).
+  // `candidates` is an optional pre-filtered list of in-mask indices with sign_mult * z_vol[idx] > ZestThr;
+  // if nullptr, all `mask_idx` are scanned.
+  double eval_single_tail_modern(const std::vector<double> &z_vol, double sign_mult,
+                                 const std::vector<int> *candidates, double sub_fallback) {
+    double z_peak = -INFINITY;
+    if (candidates == nullptr) {
+      for (int idx : mask_idx) {
+        double v = sign_mult * z_vol[idx];
+        if (v > z_peak) z_peak = v;
+      }
+    } else if (!candidates->empty()) {
+      for (int idx : *candidates) {
+        double v = sign_mult * z_vol[idx];
+        if (v > z_peak) z_peak = v;
+      }
+    } else {
+      return sub_fallback;
+    }
+
+    if (z_peak <= ZestThr) {
+      return z_peak;
+    }
+
+    double x_max = -R::pnorm5(z_peak, 0.0, 1.0, 0, 1);
+    if (x_max > top_x_grid) {
+      extend_modern_grid_to(x_max);
+    }
+
+    // Highest threshold strictly below z_peak
+    int top_hi = static_cast<int>(
+      std::lower_bound(threshs.begin(), threshs.end(), z_peak) - threshs.begin()
+    ) - 1;
+
+    if (top_hi < 0) {
+      return ZestThr;
+    }
+
+    double min_cc_th = threshs[0];
+    order.clear();
+    if (candidates == nullptr) {
+      for (int idx : mask_idx) {
+        if (sign_mult * z_vol[idx] > min_cc_th) {
+          order.push_back(idx);
+        }
+      }
+    } else {
+      for (int idx : *candidates) {
+        if (sign_mult * z_vol[idx] > min_cc_th) {
+          order.push_back(idx);
+        }
+      }
+    }
+
+    if (order.empty()) {
+      return ZestThr;
+    }
+
+    if (sign_mult > 0.0) {
+      std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return z_vol[a] > z_vol[b];
+      });
+    } else {
+      std::sort(order.begin(), order.end(), [&](int a, int b) {
+        return z_vol[a] < z_vol[b];
+      });
+    }
+
+    const size_t n_ord = order.size();
+    for (size_t k = 0; k < n_ord; ++k) {
+      accum[order[k]] = base_acc_zest;
+    }
+
+    size_t ptr = 0;
+    if (!use_nonstat) {
+      for (int hi = top_hi; hi >= 0; --hi) {
+        double h = threshs[hi];
+        while (ptr < n_ord && (sign_mult * z_vol[order[ptr]]) > h) {
+          int idx = order[ptr++];
+          parent[idx] = idx;
+          comp_sz[idx] = 1;
+
+          int z = idx / nxy;
+          int rem = idx % nxy;
+          int y = rem / nx;
+          int x = rem % nx;
+
+          for (int d = 0; d < n_nb; ++d) {
+            int xi = x + dx[d];
+            int yi = y + dy[d];
+            int zi = z + dz[d];
+            if (xi >= 0 && xi < nx && yi >= 0 && yi < ny && zi >= 0 && zi < nz) {
+              int nidx = xi + yi * nx + zi * nxy;
+              if (parent[nidx] != -1) {
+                int ra = find_root(idx);
+                int rb = find_root(nidx);
+                if (ra != rb) {
+                  if (comp_sz[ra] < comp_sz[rb]) std::swap(ra, rb);
+                  parent[rb] = ra;
+                  comp_sz[ra] += comp_sz[rb];
+                }
+              }
+            }
+          }
+        }
+        if (ptr == 0) continue;
+
+        ensure_lut_row(hi);
+        const double *s_row = &small_step_lut[static_cast<size_t>(hi) * (SMALL_C_MAX + 1)];
+
+        for (size_t k = 0; k < ptr; ++k) {
+          int idx = order[k];
+          int r = find_root(idx); // compresses parent[idx] -> r directly
+          if (r == idx) {
+            int c = comp_sz[r];
+            root_step[r] = (c <= SMALL_C_MAX) ? s_row[c] : interp_row_cubic(hi, std::log(static_cast<double>(c)));
+          }
+        }
+        for (size_t k = 0; k < ptr; ++k) {
+          int idx = order[k];
+          accum[idx] += root_step[parent[idx]];
+        }
+      }
+    } else {
+      for (int hi = top_hi; hi >= 0; --hi) {
+        double h = threshs[hi];
+        while (ptr < n_ord && (sign_mult * z_vol[order[ptr]]) > h) {
+          int idx = order[ptr++];
+          parent[idx] = idx;
+          comp_sz[idx] = 1;
+          comp_mass[idx] = vw_vec[idx];
+
+          int z = idx / nxy;
+          int rem = idx % nxy;
+          int y = rem / nx;
+          int x = rem % nx;
+
+          for (int d = 0; d < n_nb; ++d) {
+            int xi = x + dx[d];
+            int yi = y + dy[d];
+            int zi = z + dz[d];
+            if (xi >= 0 && xi < nx && yi >= 0 && yi < ny && zi >= 0 && zi < nz) {
+              int nidx = xi + yi * nx + zi * nxy;
+              if (parent[nidx] != -1) {
+                int ra = find_root(idx);
+                int rb = find_root(nidx);
+                if (ra != rb) {
+                  if (comp_sz[ra] < comp_sz[rb]) std::swap(ra, rb);
+                  parent[rb] = ra;
+                  comp_sz[ra] += comp_sz[rb];
+                  comp_mass[ra] += comp_mass[rb];
+                }
+              }
+            }
+          }
+        }
+        if (ptr == 0) continue;
+
+        ensure_lut_row(hi);
+        for (size_t k = 0; k < ptr; ++k) {
+          int idx = order[k];
+          int r = find_root(idx);
+          if (r == idx) {
+            root_step[r] = interp_row_cubic(hi, std::log(comp_mass[r]));
+          }
+        }
+        for (size_t k = 0; k < ptr; ++k) {
+          int idx = order[k];
+          accum[idx] += root_step[parent[idx]];
+        }
+      }
+    }
+
+    double max_acc = base_acc_zest;
+    for (size_t k = 0; k < n_ord; ++k) {
+      int idx = order[k];
+      if (accum[idx] > max_acc) max_acc = accum[idx];
+      parent[idx] = -1; // selective O(|order|) reset
+    }
+    double max_nlp = std::sqrt(2.0 * max_acc);
+    return R::qnorm5(-max_nlp, 0.0, 1.0, 0, 1);
+  }
+
+  // Exact legacy fallback for `use_legacy = true`
+  double eval_legacy_max(const std::vector<double> &z_vol) {
+    double z_peak = -INFINITY;
+    for (int idx : mask_idx) {
+      double v = (sided_mode == 0) ? z_vol[idx] :
+                 (sided_mode == 1) ? -z_vol[idx] : std::fabs(z_vol[idx]);
+      if (v > z_peak) z_peak = v;
+    }
+    double lpmax = R_FINITE(logpmax_fixed) ? logpmax_fixed : (-R::pnorm5(z_peak, 0.0, 1.0, 0, 1));
+    if (!std::isfinite(lpmax) || lpmax <= logpmin) lpmax = logpmin + 1e-6;
+    NumericVector th(Nh_eff);
+    NumericVector wt(Nh_eff, 1.0);
+    double dh_leg = (lpmax - logpmin) / static_cast<double>(Nh_eff - 1);
+    for (int i = 0; i < Nh_eff; ++i) {
+      double lp = logpmin + i * dh_leg;
+      th[i] = (i == 0 && logpmin == 0.0) ? -9999999999.0 : R::qnorm5(-lp, 0.0, 1.0, 0, 1);
+    }
+
+    auto max_from_tail = [&](double sgn) -> double {
+      NumericVector img_r(n, 0.0);
+      for (int idx : mask_idx) img_r[idx] = sgn * z_vol[idx];
+      NumericVector nlp = ptfce_tail_cpp(img_r, mask_r, nx, ny, nz, V, Rd,
+                                         th, wt, dh_leg, ZestThr, connectivity,
+                                         false, vw_nullable);
+      double max_nlp = -1.0;
+      for (int idx : mask_idx) {
+        if (sided_mode == 2 && (sgn * z_vol[idx]) <= 0.0) continue;
+        if (nlp[idx] > max_nlp) max_nlp = nlp[idx];
+      }
+      if (max_nlp <= 0.0) {
+        return (sided_mode == 2) ? 0.0 : R::qnorm5(1.0 - 1.11e-16, 0.0, 1.0, 0, 0);
+      }
+      double z = R::qnorm5(-max_nlp, 0.0, 1.0, 0, 1);
+      return (sided_mode == 2) ? std::max(0.0, z) : z;
+    };
+
+    if (sided_mode == 0) return max_from_tail(1.0);
+    if (sided_mode == 1) return max_from_tail(-1.0);
+    return std::max(max_from_tail(1.0), max_from_tail(-1.0));
+  }
+
+  double eval_max(const std::vector<double> &z_vol,
+                  const std::vector<int> *cand_pos = nullptr,
+                  const std::vector<int> *cand_neg = nullptr,
+                  double sub_pos = 0.0, double sub_neg = 0.0) {
+    if (use_legacy) {
+      return eval_legacy_max(z_vol);
+    }
+    if (sided_mode == 0) {
+      return eval_single_tail_modern(z_vol, 1.0, cand_pos, sub_pos);
+    }
+    if (sided_mode == 1) {
+      return eval_single_tail_modern(z_vol, -1.0, cand_neg, sub_neg);
+    }
+    // Two-sided max(|Z|): note if all voxels have |Z| <= ZestThr, max(|Z|) >= 0
+    double mp = eval_single_tail_modern(z_vol, 1.0, cand_pos, std::max(0.0, sub_pos));
+    double mn = eval_single_tail_modern(z_vol, -1.0, cand_neg, std::max(0.0, sub_neg));
+    return std::max(0.0, std::max(mp, mn));
+  }
+};
+
+} // namespace
+
+// Parametric Gaussian Random Field Monte Carlo FWER calibration (stationary & non-stationary)
+// [[Rcpp::export]]
+NumericVector calibrate_fwer_grf_cpp(LogicalVector mask,
+                                     int nx, int ny, int nz,
+                                     double V, double Rd,
+                                     NumericVector sigmasq_base,
+                                     double ZestThr,
+                                     int connectivity,
+                                     int sided_mode,
+                                     bool use_legacy,
+                                     int Nh_eff,
+                                     double logpmin,
+                                     double logpmax_fixed,
+                                     double dh,
+                                     int n_perm,
+                                     Nullable<NumericVector> voxel_weights = R_NilValue) {
+  RNGScope rng_scope;
+
+  NullPtfceEngine engine(mask, nx, ny, nz, V, Rd, ZestThr,
+                         connectivity, sided_mode, use_legacy, Nh_eff,
+                         logpmin, logpmax_fixed, dh, voxel_weights);
+
+  if (engine.mask_idx.empty() || n_perm <= 0) {
+    return NumericVector(std::max(0, n_perm), NA_REAL);
+  }
+
+  const int nxy = nx * ny;
+  // Tight 3D bounding box around active mask voxels
+  int xmin = nx, xmax = -1, ymin = ny, ymax = -1, zmin = nz, zmax = -1;
+  for (int idx : engine.mask_idx) {
+    int z = idx / nxy;
+    int rem = idx % nxy;
+    int y = rem / nx;
+    int x = rem % nx;
+    if (x < xmin) xmin = x;
+    if (x > xmax) xmax = x;
+    if (y < ymin) ymin = y;
+    if (y > ymax) ymax = y;
+    if (z < zmin) zmin = z;
+    if (z > zmax) zmax = z;
+  }
+  const int bx = xmax - xmin + 1;
+  const int by = ymax - ymin + 1;
+  const int bz = zmax - zmin + 1;
+  const int n_mask = static_cast<int>(engine.mask_idx.size());
+
+  // Map each active mask voxel to its linear offset inside the tight bounding box
+  std::vector<size_t> mask_bbox_off(n_mask);
+  for (int m = 0; m < n_mask; ++m) {
+    int idx = engine.mask_idx[m];
+    int z = idx / nxy - zmin;
+    int rem = idx % nxy;
+    int y = rem / nx - ymin;
+    int x = rem % nx - xmin;
+    mask_bbox_off[m] = (static_cast<size_t>(z) * by + y) * bx + x;
+  }
+
+  // Scale base sigmasq so its exact determinant roughness matches Rd / V
+  bool usez = (nz > 1);
+  double dim_d = usez ? 3.0 : 2.0;
+  double sx2 = std::max(1e-6, static_cast<double>(sigmasq_base[0]));
+  double sy2 = std::max(1e-6, static_cast<double>(sigmasq_base[1]));
+  double sz2 = usez ? std::max(1e-6, static_cast<double>(sigmasq_base[2])) : 0.0;
+  double dlh_target = Rd / V;
+  double dlh_raw = usez
+      ? (std::pow(sx2 * sy2 * sz2, -0.5) * std::pow(8.0, -0.5))
+      : (std::pow(sx2 * sy2, -0.5) * std::pow(4.0, -0.5));
+  if (std::isfinite(dlh_raw) && dlh_raw > 0.0 && dlh_target > 0.0) {
+    double scale_s2 = std::pow(dlh_raw / dlh_target, 2.0 / dim_d);
+    sx2 *= scale_s2;
+    sy2 *= scale_s2;
+    if (usez) sz2 *= scale_s2;
+  }
+
+  // Determine whether multi-scale non-stationary synthesis is required
+  bool multi_scale = false;
+  double u_min = 0.0, u_max = 0.0;
+  std::vector<double> u_vox;
+  if (engine.use_nonstat) {
+    u_vox.resize(n_mask);
+    for (int m = 0; m < n_mask; ++m) {
+      double wi = std::min(50.0, std::max(0.02, engine.vw_vec[engine.mask_idx[m]]));
+      u_vox[m] = -(1.0 / dim_d) * std::log(wi); // log(sigma(v) / sigma_0)
+    }
+    // Use [0.5%, 99.5%] quantiles of local log-scale so isolated boundary-winsorized
+    // voxels do not blow up 3D padding radius across the entire brain bounding box
+    std::vector<double> u_sort = u_vox;
+    int idx_lo = static_cast<int>(0.005 * static_cast<double>(n_mask));
+    int idx_hi = std::max(idx_lo, n_mask - 1 - idx_lo);
+    std::nth_element(u_sort.begin(), u_sort.begin() + idx_lo, u_sort.end());
+    u_min = u_sort[idx_lo];
+    std::nth_element(u_sort.begin() + idx_lo, u_sort.begin() + idx_hi, u_sort.end());
+    u_max = u_sort[idx_hi];
+    // Cap extreme kernel bloat at +/- log(2.5) around median while preserving 99%+ range
+    u_min = std::max(u_min, -1.10);
+    u_max = std::min(u_max,  1.10);
+    if (u_max - u_min > 1e-3) {
+      multi_scale = true;
+    }
+  }
+
+  std::vector<double> z_vol(engine.n, 0.0);
+  std::vector<double> buf1, buf2;
+  std::vector<int> cand_pos, cand_neg, touched;
+  if (!use_legacy) {
+    cand_pos.reserve(n_mask / 6 + 32);
+    cand_neg.reserve(n_mask / 6 + 32);
+    touched.reserve(n_mask / 3 + 64);
+  }
+  const double z_cut = 0.99999 * ZestThr;
+  NumericVector max_dist(n_perm);
+
+  auto eval_from_bbox_vals = [&](auto &&get_val) -> double {
+    if (use_legacy) {
+      for (int m = 0; m < n_mask; ++m) {
+        z_vol[engine.mask_idx[m]] = get_val(m);
+      }
+      return engine.eval_max(z_vol);
+    }
+    cand_pos.clear();
+    cand_neg.clear();
+    touched.clear();
+    double sub_pos = -INFINITY;
+    double sub_neg = -INFINITY;
+    for (int m = 0; m < n_mask; ++m) {
+      double val = get_val(m);
+      if (sided_mode != 1) {
+        if (val > sub_pos) sub_pos = val;
+        if (val > z_cut) {
+          int idx = engine.mask_idx[m];
+          z_vol[idx] = val;
+          cand_pos.push_back(idx);
+          touched.push_back(idx);
+        }
+      }
+      if (sided_mode != 0) {
+        double nval = -val;
+        if (nval > sub_neg) sub_neg = nval;
+        if (nval > z_cut) {
+          int idx = engine.mask_idx[m];
+          z_vol[idx] = val;
+          cand_neg.push_back(idx);
+          touched.push_back(idx);
+        }
+      }
+    }
+    double out_m = engine.eval_max(z_vol, &cand_pos, &cand_neg, sub_pos, sub_neg);
+    for (int idx : touched) {
+      z_vol[idx] = 0.0;
+    }
+    return out_m;
+  };
+
+  if (!multi_scale) {
+    // Stationary anisotropic 3D Gaussian filter on tight padded mask bounding box
+    std::vector<double> kx, ky, kz;
+    int rx = 0, ry = 0, rz = 0;
+    solve_discrete_kernel_1d(sx2, nx, kx, rx);
+    solve_discrete_kernel_1d(sy2, ny, ky, ry);
+    solve_discrete_kernel_1d(sz2, nz, kz, rz);
+
+    const int px = bx + 2 * rx;
+    const int py = by + 2 * ry;
+    const int pz = bz + 2 * rz;
+    const size_t n_pad = static_cast<size_t>(px) * py * pz;
+    std::vector<double> w_pad(n_pad);
+    std::vector<double> g_bbox;
+
+    for (int b = 0; b < n_perm; ++b) {
+      if (b % 32 == 0) Rcpp::checkUserInterrupt();
+      for (size_t i = 0; i < n_pad; ++i) {
+        w_pad[i] = R::norm_rand();
+      }
+      convolve_padded_bbox_3d(w_pad, px, py, pz, rx, ry, rz, bx, by, bz,
+                              kx, rx, ky, ry, kz, rz, buf1, buf2, g_bbox);
+      max_dist[b] = eval_from_bbox_vals([&](int m) -> double {
+        return g_bbox[mask_bbox_off[m]];
+      });
+    }
+  } else {
+    // Multi-scale separable Gaussian filter bank (K = 4 log-spaced scales) driven by
+    // shared white noise with exact closed-form cross-scale variance normalization
+    const int K = 4;
+    double du = (u_max - u_min) / static_cast<double>(K - 1);
+    std::vector<std::vector<double>> kx_k(K), ky_k(K), kz_k(K);
+    std::vector<int> rx_k(K), ry_k(K), rz_k(K);
+    int max_rx = 0, max_ry = 0, max_rz = 0;
+
+    for (int k = 0; k < K; ++k) {
+      double alpha2 = std::exp(2.0 * (u_min + k * du));
+      solve_discrete_kernel_1d(sx2 * alpha2, nx, kx_k[k], rx_k[k]);
+      solve_discrete_kernel_1d(sy2 * alpha2, ny, ky_k[k], ry_k[k]);
+      solve_discrete_kernel_1d(sz2 * alpha2, nz, kz_k[k], rz_k[k]);
+      if (rx_k[k] > max_rx) max_rx = rx_k[k];
+      if (ry_k[k] > max_ry) max_ry = ry_k[k];
+      if (rz_k[k] > max_rz) max_rz = rz_k[k];
+    }
+
+    auto kern_dot = [](const std::vector<double> &ka, int ra,
+                       const std::vector<double> &kb, int rb) -> double {
+      int r_common = std::min(ra, rb);
+      double acc = 0.0;
+      for (int m = -r_common; m <= r_common; ++m) {
+        acc += ka[m + ra] * kb[m + rb];
+      }
+      return acc;
+    };
+
+    std::vector<double> cross_corr(K - 1, 1.0);
+    for (int k = 0; k < K - 1; ++k) {
+      cross_corr[k] = kern_dot(kx_k[k], rx_k[k], kx_k[k + 1], rx_k[k + 1]) *
+                      kern_dot(ky_k[k], ry_k[k], ky_k[k + 1], ry_k[k + 1]) *
+                      kern_dot(kz_k[k], rz_k[k], kz_k[k + 1], rz_k[k + 1]);
+    }
+
+    // Precompute exact unit-variance blending coefficients (k0[m], c0[m], c1[m]) per mask voxel
+    std::vector<int> knot_lo(n_mask);
+    std::vector<double> coef0(n_mask), coef1(n_mask);
+    double inv_du = 1.0 / du;
+    for (int m = 0; m < n_mask; ++m) {
+      double u_clamped = std::min(u_max, std::max(u_min, u_vox[m]));
+      double pos = (u_clamped - u_min) * inv_du;
+      int k = static_cast<int>(std::floor(pos));
+      if (k < 0) k = 0;
+      if (k > K - 2) k = K - 2;
+      double t = std::min(1.0, std::max(0.0, pos - static_cast<double>(k)));
+      double om_t = 1.0 - t;
+      double var_blend = om_t * om_t + t * t + 2.0 * t * om_t * cross_corr[k];
+      double inv_sd = 1.0 / std::sqrt(std::max(1e-12, var_blend));
+      knot_lo[m] = k;
+      coef0[m] = om_t * inv_sd;
+      coef1[m] = t * inv_sd;
+    }
+
+    const int px = bx + 2 * max_rx;
+    const int py = by + 2 * max_ry;
+    const int pz = bz + 2 * max_rz;
+    const size_t n_pad = static_cast<size_t>(px) * py * pz;
+    std::vector<double> w_pad(n_pad);
+    std::vector<std::vector<double>> g_scales(K);
+
+    for (int b = 0; b < n_perm; ++b) {
+      if (b % 16 == 0) Rcpp::checkUserInterrupt();
+      for (size_t i = 0; i < n_pad; ++i) {
+        w_pad[i] = R::norm_rand();
+      }
+      for (int k = 0; k < K; ++k) {
+        convolve_padded_bbox_3d(w_pad, px, py, pz, max_rx, max_ry, max_rz,
+                                bx, by, bz,
+                                kx_k[k], rx_k[k], ky_k[k], ry_k[k], kz_k[k], rz_k[k],
+                                buf1, buf2, g_scales[k]);
+      }
+      max_dist[b] = eval_from_bbox_vals([&](int m) -> double {
+        int k = knot_lo[m];
+        size_t boff = mask_bbox_off[m];
+        return coef0[m] * g_scales[k][boff] + coef1[m] * g_scales[k + 1][boff];
+      });
+    }
+  }
+
+  return max_dist;
+}
+
+// Fast Rademacher sign-flipping FWER calibration for 4D subject COPEs or 4D GLM residuals
+// [[Rcpp::export]]
+List calibrate_fwer_signflip_cpp(NumericVector data4d,
+                                 LogicalVector mask,
+                                 int nx, int ny, int nz, int nt,
+                                 bool center_residuals,
+                                 double V, double Rd, double ZestThr,
+                                 int connectivity, int sided_mode,
+                                 bool use_legacy, int Nh_eff,
+                                 double logpmin, double logpmax_fixed,
+                                 double dh, int n_perm,
+                                 Nullable<NumericVector> voxel_weights = R_NilValue) {
+  RNGScope rng_scope;
+
+  NullPtfceEngine engine(mask, nx, ny, nz, V, Rd, ZestThr,
+                         connectivity, sided_mode, use_legacy, Nh_eff,
+                         logpmin, logpmax_fixed, dh, voxel_weights);
+
+  const R_xlen_t n_vox = static_cast<R_xlen_t>(nx) * ny * nz;
+  const int n_mask = static_cast<int>(engine.mask_idx.size());
+
+  // Extract active finite non-constant mask voxels and unit-normalize each voxel's nt-vector
+  std::vector<int> active_vox;
+  active_vox.reserve(n_mask);
+  std::vector<double> tmp_t(nt);
+  std::vector<double> rows_tmp;
+  rows_tmp.reserve(static_cast<size_t>(n_mask) * nt);
+
+  double ar1_sum = 0.0;
+  int ar1_cnt = 0;
+
+  for (int m = 0; m < n_mask; ++m) {
+    int idx = engine.mask_idx[m];
+    bool ok = true;
+    double sum_v = 0.0;
+    for (int t = 0; t < nt; ++t) {
+      double val = data4d[static_cast<R_xlen_t>(t) * n_vox + idx];
+      if (!std::isfinite(val)) {
+        ok = false;
+        break;
+      }
+      tmp_t[t] = val;
+      sum_v += val;
+    }
+    if (!ok) continue;
+
+    if (center_residuals) {
+      double mu = sum_v / static_cast<double>(nt);
+      for (int t = 0; t < nt; ++t) tmp_t[t] -= mu;
+    }
+
+    double ssq = 0.0;
+    for (int t = 0; t < nt; ++t) ssq += tmp_t[t] * tmp_t[t];
+    if (!std::isfinite(ssq) || ssq <= 1e-30) continue;
+
+    double inv_norm = 1.0 / std::sqrt(ssq);
+    for (int t = 0; t < nt; ++t) tmp_t[t] *= inv_norm;
+
+    // Track lag-1 autocorrelation along 4th dimension (centered) to diagnose unwhitened TRs
+    double mu_u = 0.0;
+    if (!center_residuals) {
+      for (int t = 0; t < nt; ++t) mu_u += tmp_t[t];
+      mu_u /= static_cast<double>(nt);
+    }
+    double num_ar = 0.0, den_ar = 0.0;
+    for (int t = 0; t < nt; ++t) {
+      double d0 = tmp_t[t] - mu_u;
+      den_ar += d0 * d0;
+      if (t > 0) num_ar += d0 * (tmp_t[t - 1] - mu_u);
+    }
+    if (den_ar > 1e-16) {
+      ar1_sum += num_ar / den_ar;
+      ar1_cnt++;
+    }
+
+    active_vox.push_back(idx);
+    for (int t = 0; t < nt; ++t) rows_tmp.push_back(tmp_t[t]);
+  }
+
+  const int n_act = static_cast<int>(active_vox.size());
+  if (n_act == 0) {
+    stop("4D input for `sign_flip` contains zero finite non-constant voxels inside `mask`.");
+  }
+  double mean_temp_ar1 = (ar1_cnt > 0) ? (ar1_sum / static_cast<double>(ar1_cnt)) : 0.0;
+
+  // Transpose into contiguous column-major `U_col[t * n_act + a]` for SIMD DAXPY speed
+  std::vector<double> U_col(static_cast<size_t>(nt) * n_act);
+  for (int a = 0; a < n_act; ++a) {
+    const double *row = &rows_tmp[static_cast<size_t>(a) * nt];
+    for (int t = 0; t < nt; ++t) {
+      U_col[static_cast<size_t>(t) * n_act + a] = row[t];
+    }
+  }
+
+  // If `center_residuals`, identify an exact orthonormal basis Q (nt x nu_sub) of the
+  // empirical GLM residual row-space via two-pass Modified Gram-Schmidt
+  std::vector<double> Q;
+  int nu_sub = nt;
+  if (center_residuals) {
+    Q.reserve(static_cast<size_t>(nt) * nt);
+    nu_sub = 0;
+    int max_rank = nt - 1;
+    int stride = std::max(1, n_act / std::max(8 * nt, 512));
+    std::vector<double> v(nt);
+
+    for (int pass = 0; pass < 2 && nu_sub < max_rank; ++pass) {
+      int step = (pass == 0) ? stride : 1;
+      for (int a = 0; a < n_act && nu_sub < max_rank; a += step) {
+        const double *row = &rows_tmp[static_cast<size_t>(a) * nt];
+        std::copy(row, row + nt, v.begin());
+        // Two-pass Gram-Schmidt orthogonalization for machine-precision orthogonality
+        for (int gs = 0; gs < 2; ++gs) {
+          for (int j = 0; j < nu_sub; ++j) {
+            const double *qj = &Q[static_cast<size_t>(j) * nt];
+            double dot = 0.0;
+            for (int t = 0; t < nt; ++t) dot += qj[t] * v[t];
+            for (int t = 0; t < nt; ++t) v[t] -= dot * qj[t];
+          }
+        }
+        double nrm2 = 0.0;
+        for (int t = 0; t < nt; ++t) nrm2 += v[t] * v[t];
+        if (nrm2 > 1e-9) {
+          double inv_n = 1.0 / std::sqrt(nrm2);
+          for (int t = 0; t < nt; ++t) Q.push_back(v[t] * inv_n);
+          nu_sub++;
+        }
+      }
+    }
+  }
+
+  std::vector<double>().swap(rows_tmp); // free temporary row buffer
+
+  double dof_t = static_cast<double>(nu_sub - 1);
+  if (dof_t < 4.0) {
+    stop("Too few residual degrees of freedom (eff_df < 4) for Rademacher sign-flipping calibration.");
+  }
+
+  // Build 512-node cubic Lagrange LUT for t -> Z on [0, 24] + exact log-space fallback above 24
+  const int N_T_LUT = 512;
+  const double T_LUT_MAX = 24.0;
+  const double dt_lut = T_LUT_MAX / static_cast<double>(N_T_LUT - 1);
+  const double inv_dt_lut = 1.0 / dt_lut;
+  std::vector<double> t2z_lut(N_T_LUT, 0.0);
+  for (int g = 1; g < N_T_LUT; ++g) {
+    double tv = g * dt_lut;
+    double lp = R::pt(tv, dof_t, 0, 1);
+    t2z_lut[g] = R::qnorm5(lp, 0.0, 1.0, 0, 1);
+  }
+
+  auto fast_r_to_z_pos = [&](double r_pos) -> double {
+    if (r_pos <= 0.0) return 0.0;
+    double r_clamped = std::min(0.99999999, r_pos);
+    double om_r2 = std::max(1e-15, (1.0 - r_clamped) * (1.0 + r_clamped));
+    double tv = std::sqrt(dof_t / om_r2) * r_clamped;
+    if (tv >= T_LUT_MAX - 2.0 * dt_lut) {
+      double lp = R::pt(tv, dof_t, 0, 1);
+      return R::qnorm5(lp, 0.0, 1.0, 0, 1);
+    }
+    return interp_cubic_equispaced(t2z_lut, 0.0, inv_dt_lut, tv);
+  };
+
+  auto exact_r_to_z_signed = [&](double r_val) -> double {
+    if (r_val == 0.0) return 0.0;
+    double sgn = (r_val > 0.0) ? 1.0 : -1.0;
+    return sgn * fast_r_to_z_pos(std::fabs(r_val));
+  };
+
+  // Cutoff on |r| corresponding to ZestThr (with 0.99999 safety margin)
+  double lp_zest = R::pnorm5(ZestThr, 0.0, 1.0, 0, 1);
+  double t_zest = R::qt(lp_zest, dof_t, 0, 1);
+  double r_zest = 0.99999 * (t_zest / std::sqrt(dof_t + t_zest * t_zest));
+
+  std::vector<double> z_vol(engine.n, 0.0);
+  std::vector<double> r_vec(n_act, 0.0);
+  std::vector<double> s_raw(nt, 1.0);
+  std::vector<double> q_flip(nt, 0.0);
+  std::vector<double> q_coef(nu_sub, 0.0);
+  std::vector<int> cand_pos, cand_neg, touched;
+  cand_pos.reserve(n_act / 6 + 32);
+  cand_neg.reserve(n_act / 6 + 32);
+  touched.reserve(n_act / 3 + 64);
+
+  NumericVector max_dist(n_perm);
+  const double inv_sqrt_nt = 1.0 / std::sqrt(static_cast<double>(nt));
+
+  for (int b = 0; b < n_perm; ++b) {
+    if (b % 32 == 0) Rcpp::checkUserInterrupt();
+
+    // Draw valid non-degenerate Rademacher vector and normalize in subspace if needed
+    for (int attempt = 0; attempt < 64; ++attempt) {
+      int n_pos = 0;
+      for (int t = 0; t < nt; ++t) {
+        if (R::unif_rand() < 0.5) {
+          s_raw[t] = 1.0;
+          n_pos++;
+        } else {
+          s_raw[t] = -1.0;
+        }
+      }
+      if (!center_residuals) {
+        // Exclude unflipped all-+1 (and all--1 in two-sided mode) if nt is large enough
+        if (n_pos == nt || (sided_mode == 2 && n_pos == 0)) {
+          if (attempt < 63) continue;
+        }
+        for (int t = 0; t < nt; ++t) q_flip[t] = s_raw[t] * inv_sqrt_nt;
+        break;
+      } else {
+        // Project s_raw onto orthonormal residual subspace Q: q_flip = Q (Q^T s_raw)
+        for (int j = 0; j < nu_sub; ++j) {
+          const double *qj = &Q[static_cast<size_t>(j) * nt];
+          double dot = 0.0;
+          for (int t = 0; t < nt; ++t) dot += qj[t] * s_raw[t];
+          q_coef[j] = dot;
+        }
+        std::fill(q_flip.begin(), q_flip.end(), 0.0);
+        for (int j = 0; j < nu_sub; ++j) {
+          const double *qj = &Q[static_cast<size_t>(j) * nt];
+          double cj = q_coef[j];
+          for (int t = 0; t < nt; ++t) q_flip[t] += cj * qj[t];
+        }
+        double nrm2 = 0.0;
+        for (int t = 0; t < nt; ++t) nrm2 += q_flip[t] * q_flip[t];
+        if (nrm2 >= 0.15 * static_cast<double>(nu_sub) || attempt == 63) {
+          double inv_n = 1.0 / std::sqrt(std::max(1e-30, nrm2));
+          for (int t = 0; t < nt; ++t) q_flip[t] *= inv_n;
+          break;
+        }
+      }
+    }
+
+    // Contiguous SIMD DAXPY: r_vec = U_col * q_flip
+    std::fill(r_vec.begin(), r_vec.end(), 0.0);
+    for (int t = 0; t < nt; ++t) {
+      const double qt = q_flip[t];
+      const double *col = &U_col[static_cast<size_t>(t) * n_act];
+      for (int a = 0; a < n_act; ++a) {
+        r_vec[a] += qt * col[a];
+      }
+    }
+
+    if (use_legacy) {
+      for (int a = 0; a < n_act; ++a) {
+        z_vol[active_vox[a]] = exact_r_to_z_signed(r_vec[a]);
+      }
+      max_dist[b] = engine.eval_max(z_vol);
+    } else {
+      cand_pos.clear();
+      cand_neg.clear();
+      touched.clear();
+      double max_r_pos = -2.0;
+      double max_r_neg = -2.0;
+
+      for (int a = 0; a < n_act; ++a) {
+        double rv = r_vec[a];
+        if (sided_mode != 1) {
+          if (rv > max_r_pos) max_r_pos = rv;
+          if (rv > r_zest) {
+            int idx = active_vox[a];
+            z_vol[idx] = fast_r_to_z_pos(rv);
+            cand_pos.push_back(idx);
+            touched.push_back(idx);
+          }
+        }
+        if (sided_mode != 0) {
+          double nrv = -rv;
+          if (nrv > max_r_neg) max_r_neg = nrv;
+          if (nrv > r_zest) {
+            int idx = active_vox[a];
+            z_vol[idx] = -fast_r_to_z_pos(nrv);
+            cand_neg.push_back(idx);
+            touched.push_back(idx);
+          }
+        }
+      }
+
+      double sub_pos = (sided_mode != 1 && cand_pos.empty()) ? exact_r_to_z_signed(max_r_pos) : 0.0;
+      double sub_neg = (sided_mode != 0 && cand_neg.empty()) ? exact_r_to_z_signed(max_r_neg) : 0.0;
+
+      max_dist[b] = engine.eval_max(z_vol, &cand_pos, &cand_neg, sub_pos, sub_neg);
+
+      for (int idx : touched) {
+        z_vol[idx] = 0.0;
+      }
+    }
+  }
+
+  return List::create(
+    Named("null_max_Z") = max_dist,
+    Named("eff_df") = dof_t,
+    Named("mean_temp_ar1") = mean_temp_ar1,
+    Named("n_active") = n_act
+  );
+}
+

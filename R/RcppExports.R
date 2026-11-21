@@ -21,3 +21,11 @@ smoothest_cpp <- function(img, mask, nx, ny, nz, nt, compute_local = FALSE, smoo
     .Call(`_pTFCE_smoothest_cpp`, img, mask, nx, ny, nz, nt, compute_local, smooth_fwhm, dof_correction)
 }
 
+calibrate_fwer_grf_cpp <- function(mask, nx, ny, nz, V, Rd, sigmasq_base, ZestThr, connectivity, sided_mode, use_legacy, Nh_eff, logpmin, logpmax_fixed, dh, n_perm, voxel_weights = NULL) {
+    .Call(`_pTFCE_calibrate_fwer_grf_cpp`, mask, nx, ny, nz, V, Rd, sigmasq_base, ZestThr, connectivity, sided_mode, use_legacy, Nh_eff, logpmin, logpmax_fixed, dh, n_perm, voxel_weights)
+}
+
+calibrate_fwer_signflip_cpp <- function(data4d, mask, nx, ny, nz, nt, center_residuals, V, Rd, ZestThr, connectivity, sided_mode, use_legacy, Nh_eff, logpmin, logpmax_fixed, dh, n_perm, voxel_weights = NULL) {
+    .Call(`_pTFCE_calibrate_fwer_signflip_cpp`, data4d, mask, nx, ny, nz, nt, center_residuals, V, Rd, ZestThr, connectivity, sided_mode, use_legacy, Nh_eff, logpmin, logpmax_fixed, dh, n_perm, voxel_weights)
+}
+

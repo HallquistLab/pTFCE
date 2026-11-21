@@ -1,8 +1,15 @@
 # change.log
 
+v0.4.1 (Empirical FWER threshold calibration)
+- Added `fwe_method = c("grf", "grf_sim", "sign_flip")`, `n_perm = 500L`, and `copes = NULL` to `ptfce()` (default `"grf"` preserves exact backward compatibility) to overcome the conservativeness of raw-field Euler characteristic FWER thresholds on pTFCE-enhanced maps
+- Implemented `calibrate_fwer_grf_cpp()`: parametric 2D/3D Gaussian Random Field Monte Carlo simulator supporting both stationary anisotropic smoothness and multi-scale non-stationary smoothness (`nonstationary = TRUE`) with exact analytical cross-scale variance normalization
+- Implemented `calibrate_fwer_signflip_cpp()`: fast SIMD-friendly Rademacher (`+/- 1`) sign-flipping calibration across either 4D subject contrast stacks (`copes`, auto-estimating 4D residual smoothness when `residual` is omitted) or 4D GLM residuals (`residual`, using two-pass Modified Gram-Schmidt projection onto the empirical residual subspace)
+- Added lazy 2D posterior lookup-table (`NullPtfceEngine`) and supra-`ZestThr` candidate pre-filtering in C++ to evaluate `max(Z)` / `max(|Z|)` across hundreds of null replicates with zero per-replicate quadrature or heap churn
+- Returned `fwe_method` and `null_max_Z` in `"ptfce"` objects and updated `print.ptfce()`
+
 v0.4.0 (Non-stationary smoothness adjustment)
 - Added optional non-stationary smoothness adjustment (`nonstationary = TRUE` in `ptfce()` and `smoothest()`, default `FALSE`) based on Worsley et al. (1999), Hayasaka et al. (2004), and Salimi-Khorshidi et al. (2011)
-- Extended `smoothest()` C++ engine with normalized within-mask separable 3D Gaussian smoothing (`smooth_fwhm = 3.0`) and empirical-Bayes shrinkage of voxelwise derivative sufficient statistics, outputting `dLh_map`, `rpv_map` (RESELs per voxel), and mean-1 `voxel_weights`
+- Extended `smoothest()` C++ engine with normalized within-mask separable 3D Gaussian smoothing (`smooth_fwhm = 3.0`) and empirical-Bayes shrinkage of voxelwise derivative sufficient statistics, outputting `dLh_map`, `rpv_map` (RESELs per voxel), `dLh_nonstationary` (Riemannian integral `mean(dLh_map)`), `resels_nonstationary`, and mean-1 `voxel_weights` (winsorized to `[0.02, 50.0]`)
 - Extended `ptfce_tail_cpp()` with continuous resel-weighted cluster mass accumulation and fast 4-point cubic Lagrange log-space interpolation tables
 - Added `local_smoothness` parameter to `ptfce()` allowing reuse of precomputed `smoothest(..., nonstationary = TRUE)` objects or external RPV/roughness maps (e.g. SPM `RPV.nii`) across multiple contrasts
 

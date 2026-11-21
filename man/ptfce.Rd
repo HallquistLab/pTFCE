@@ -24,7 +24,10 @@ ptfce(
   legacy = FALSE,
   nonstationary = FALSE,
   local_smoothness = NULL,
-  smooth_fwhm = 3
+  smooth_fwhm = 3,
+  fwe_method = c("grf", "grf_sim", "sign_flip"),
+  n_perm = 500L,
+  copes = NULL
 )
 }
 \arguments{
@@ -72,10 +75,9 @@ grid-invariant integration mode (default: \code{0.05}). Ignored when \code{Nh} o
 AFNI NN=1), \code{18} (faces or edges touch; AFNI NN=2), or \code{26} (faces, edges,
 or corners touch; AFNI NN=3).}
 
-\item{fwe_p}{Numeric vector of Family-Wise Error Rate alpha levels for which GRF
-Z-score thresholds are computed (default: \code{0.05}). In \code{sided = "two.sided"}
-mode, each tail is controlled at \code{fwe_p / 2} so \code{abs(Z) >= fwe.Z} controls
-two-sided FWER at \code{fwe_p}.}
+\item{fwe_p}{Numeric vector of Family-Wise Error Rate alpha levels for which
+Z-score thresholds are computed (default: \code{0.05}). When \code{sided = "two.sided"},
+thresholding at \code{abs(Z) >= fwe.Z} controls two-sided FWER at \code{fwe_p}.}
 
 \item{legacy}{Logical; if \code{TRUE}, uses upstream \code{Nh}-point discrete summation
 from \code{logpmin} to \code{logpmax} instead of analytical sub-\code{ZestThr}
@@ -95,6 +97,31 @@ automatically enables \code{nonstationary = TRUE} unless explicitly set to \code
 \item{smooth_fwhm}{Numeric scalar; spatial Gaussian smoothing FWHM in voxels applied
 within the mask to regularize voxelwise derivative statistics when estimating
 non-stationary smoothness (default: \code{3.0}; Salimi-Khorshidi et al., 2011).}
+
+\item{fwe_method}{Method used to compute FWER-corrected Z-score thresholds
+(\code{fwer0.05.Z} and \code{fwe.Z}):
+\itemize{
+  \item \code{"grf"} (default): Fast analytical Gaussian Random Field Euler
+    characteristic threshold from \code{number_of_resels} via \code{\link{fwe.p2z}}.
+    Conservative on pTFCE-enhanced maps because pTFCE smooths supra-threshold peaks.
+  \item \code{"grf_sim"}: Parametric GRF Monte Carlo simulation (\code{n_perm} null
+    replicates) synthesized on the exact \code{mask} geometry with stationary
+    anisotropic or multi-scale non-stationary smoothness and enhanced by the exact
+    same pTFCE operator.
+  \item \code{"sign_flip"}: Nonparametric Rademacher (\eqn{\pm 1}) sign-flipping
+    calibration (\code{n_perm} replicates) across 4D subject-level contrasts
+    (\code{copes}) or 4D GLM residuals (\code{residual}), preserving empirical
+    spatial covariance, non-stationarity, and heavy-tailed noise structure.
+}
+Supplying \code{copes} automatically selects \code{fwe_method = "sign_flip"} unless
+\code{fwe_method} is explicitly specified.}
+
+\item{n_perm}{Integer number of Monte Carlo replicates used when
+\code{fwe_method = "grf_sim"} or \code{"sign_flip"} (default: \code{500L}).}
+
+\item{copes}{Optional 4D image (or NIfTI file path) of independent subject-level
+contrast / COPE volumes for group-level Rademacher sign-flipping FWER calibration
+(and automatic 4D residual smoothness estimation when \code{residual} is omitted).}
 }
 \value{
 An object of class \code{"ptfce"} (a list) containing:
@@ -103,13 +130,17 @@ An object of class \code{"ptfce"} (a list) containing:
   \item \strong{logp}: Negative natural logarithm \code{-log(p)} of enhanced p-values.
   \item \strong{Z}: Enhanced Z-score image (signed when \code{sided = "two.sided"}).
   \item \strong{number_of_resels}: Estimated number of resels in the mask.
-  \item \strong{fwer0.05.Z}: GRF FWER Z-score threshold at \code{alpha = 0.05}
-    (adjusted to \code{0.025} per tail when \code{sided = "two.sided"}).
-  \item \strong{fwe.Z}: Named numeric vector of GRF FWER Z-score thresholds corresponding
+  \item \strong{fwer0.05.Z}: FWER Z-score threshold at \code{alpha = 0.05}.
+  \item \strong{fwe.Z}: Named numeric vector of FWER Z-score thresholds corresponding
     to \code{fwe_p}.
   \item \strong{sided}: Enhancement sidedness used.
   \item \strong{nonstationary}: Logical indicating whether non-stationary smoothness
     adjustment was applied.
+  \item \strong{fwe_method}: FWER calibration method used (\code{"grf"},
+    \code{"grf_sim"}, or \code{"sign_flip"}).
+  \item \strong{null_max_Z}: Numeric vector of length \code{n_perm} containing the
+    simulated null maximum enhanced Z-scores when \code{fwe_method != "grf"}
+    (\code{NULL} when \code{fwe_method = "grf"}).
 }
 }
 \description{
@@ -136,11 +167,20 @@ excursion sets are enhanced independently on identical threshold grids:
 }
 
 When \code{nonstationary = TRUE} (ideally paired with 4D \code{residual} and \code{dof},
-or a precomputed \code{local_smoothness} map), each supra-threshold cluster's extent is
-measured in local resel-scaled voxel units \eqn{\tilde{c}(\mathcal{C}) = \sum_{v \in \mathcal{C}} w(v)}
-rather than raw voxel count. Smooth brain regions (\eqn{w(v) < 1}) are appropriately
-tempered against noise-blob inflation, while rougher regions (\eqn{w(v) > 1}, e.g.
-subcortex) gain sensitivity for compact true signals.
+4D \code{copes}, or a precomputed \code{local_smoothness} map), each supra-threshold
+cluster's extent is measured in local resel-scaled voxel units
+\eqn{\tilde{c}(\mathcal{C}) = \sum_{v \in \mathcal{C}} w(v)} rather than raw voxel count.
+Smooth brain regions (\eqn{w(v) < 1}) are appropriately tempered against noise-blob
+inflation, while rougher regions (\eqn{w(v) > 1}, e.g. subcortex) gain sensitivity for
+compact true signals.
+
+Because the pTFCE-enhanced field is smoother than the raw input Z-map, the classical
+raw-field Euler characteristic formula (\code{fwe_method = "grf"}) is conservative
+(typical empirical FWER \eqn{\approx 0.005\text{--}0.015} at nominal \eqn{\alpha = 0.05}).
+Setting \code{fwe_method = "grf_sim"} or \code{fwe_method = "sign_flip"} calibrates the
+exact distribution of \eqn{\max_{v \in \mathcal{M}} \tilde{Z}(v)} (or
+\eqn{\max_{v \in \mathcal{M}} |\tilde{Z}(v)|} in \code{"two.sided"} mode) via a fast
+lookup-table-accelerated C++ engine, recovering full nominal statistical power.
 }
 \examples{
 \dontrun{
@@ -148,10 +188,17 @@ subcortex) gain sensitivity for compact true signals.
 res <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
              residual = "res4d.nii.gz", dof = 42, sided = "two.sided")
 
-# With non-stationary smoothness adjustment from 4D residuals:
-res_ns <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
-                residual = "res4d.nii.gz", dof = 42,
-                sided = "two.sided", nonstationary = TRUE)
+# Non-stationary pTFCE with parametric GRF simulation FWER calibration:
+res_sim <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
+                 residual = "res4d.nii.gz", dof = 42,
+                 sided = "two.sided", nonstationary = TRUE,
+                 fwe_method = "grf_sim", n_perm = 500)
+
+# Group-level non-stationary pTFCE with Rademacher sign-flipping calibration:
+res_sf <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
+                copes = "all_copes_4d.nii.gz",
+                sided = "two.sided", nonstationary = TRUE,
+                fwe_method = "sign_flip", n_perm = 500)
 }
 }
 \references{

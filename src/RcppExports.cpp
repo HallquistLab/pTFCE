@@ -96,6 +96,62 @@ BEGIN_RCPP
     return rcpp_result_gen;
 END_RCPP
 }
+// calibrate_fwer_grf_cpp
+NumericVector calibrate_fwer_grf_cpp(LogicalVector mask, int nx, int ny, int nz, double V, double Rd, NumericVector sigmasq_base, double ZestThr, int connectivity, int sided_mode, bool use_legacy, int Nh_eff, double logpmin, double logpmax_fixed, double dh, int n_perm, Nullable<NumericVector> voxel_weights);
+RcppExport SEXP _pTFCE_calibrate_fwer_grf_cpp(SEXP maskSEXP, SEXP nxSEXP, SEXP nySEXP, SEXP nzSEXP, SEXP VSEXP, SEXP RdSEXP, SEXP sigmasq_baseSEXP, SEXP ZestThrSEXP, SEXP connectivitySEXP, SEXP sided_modeSEXP, SEXP use_legacySEXP, SEXP Nh_effSEXP, SEXP logpminSEXP, SEXP logpmax_fixedSEXP, SEXP dhSEXP, SEXP n_permSEXP, SEXP voxel_weightsSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< LogicalVector >::type mask(maskSEXP);
+    Rcpp::traits::input_parameter< int >::type nx(nxSEXP);
+    Rcpp::traits::input_parameter< int >::type ny(nySEXP);
+    Rcpp::traits::input_parameter< int >::type nz(nzSEXP);
+    Rcpp::traits::input_parameter< double >::type V(VSEXP);
+    Rcpp::traits::input_parameter< double >::type Rd(RdSEXP);
+    Rcpp::traits::input_parameter< NumericVector >::type sigmasq_base(sigmasq_baseSEXP);
+    Rcpp::traits::input_parameter< double >::type ZestThr(ZestThrSEXP);
+    Rcpp::traits::input_parameter< int >::type connectivity(connectivitySEXP);
+    Rcpp::traits::input_parameter< int >::type sided_mode(sided_modeSEXP);
+    Rcpp::traits::input_parameter< bool >::type use_legacy(use_legacySEXP);
+    Rcpp::traits::input_parameter< int >::type Nh_eff(Nh_effSEXP);
+    Rcpp::traits::input_parameter< double >::type logpmin(logpminSEXP);
+    Rcpp::traits::input_parameter< double >::type logpmax_fixed(logpmax_fixedSEXP);
+    Rcpp::traits::input_parameter< double >::type dh(dhSEXP);
+    Rcpp::traits::input_parameter< int >::type n_perm(n_permSEXP);
+    Rcpp::traits::input_parameter< Nullable<NumericVector> >::type voxel_weights(voxel_weightsSEXP);
+    rcpp_result_gen = Rcpp::wrap(calibrate_fwer_grf_cpp(mask, nx, ny, nz, V, Rd, sigmasq_base, ZestThr, connectivity, sided_mode, use_legacy, Nh_eff, logpmin, logpmax_fixed, dh, n_perm, voxel_weights));
+    return rcpp_result_gen;
+END_RCPP
+}
+// calibrate_fwer_signflip_cpp
+List calibrate_fwer_signflip_cpp(NumericVector data4d, LogicalVector mask, int nx, int ny, int nz, int nt, bool center_residuals, double V, double Rd, double ZestThr, int connectivity, int sided_mode, bool use_legacy, int Nh_eff, double logpmin, double logpmax_fixed, double dh, int n_perm, Nullable<NumericVector> voxel_weights);
+RcppExport SEXP _pTFCE_calibrate_fwer_signflip_cpp(SEXP data4dSEXP, SEXP maskSEXP, SEXP nxSEXP, SEXP nySEXP, SEXP nzSEXP, SEXP ntSEXP, SEXP center_residualsSEXP, SEXP VSEXP, SEXP RdSEXP, SEXP ZestThrSEXP, SEXP connectivitySEXP, SEXP sided_modeSEXP, SEXP use_legacySEXP, SEXP Nh_effSEXP, SEXP logpminSEXP, SEXP logpmax_fixedSEXP, SEXP dhSEXP, SEXP n_permSEXP, SEXP voxel_weightsSEXP) {
+BEGIN_RCPP
+    Rcpp::RObject rcpp_result_gen;
+    Rcpp::RNGScope rcpp_rngScope_gen;
+    Rcpp::traits::input_parameter< NumericVector >::type data4d(data4dSEXP);
+    Rcpp::traits::input_parameter< LogicalVector >::type mask(maskSEXP);
+    Rcpp::traits::input_parameter< int >::type nx(nxSEXP);
+    Rcpp::traits::input_parameter< int >::type ny(nySEXP);
+    Rcpp::traits::input_parameter< int >::type nz(nzSEXP);
+    Rcpp::traits::input_parameter< int >::type nt(ntSEXP);
+    Rcpp::traits::input_parameter< bool >::type center_residuals(center_residualsSEXP);
+    Rcpp::traits::input_parameter< double >::type V(VSEXP);
+    Rcpp::traits::input_parameter< double >::type Rd(RdSEXP);
+    Rcpp::traits::input_parameter< double >::type ZestThr(ZestThrSEXP);
+    Rcpp::traits::input_parameter< int >::type connectivity(connectivitySEXP);
+    Rcpp::traits::input_parameter< int >::type sided_mode(sided_modeSEXP);
+    Rcpp::traits::input_parameter< bool >::type use_legacy(use_legacySEXP);
+    Rcpp::traits::input_parameter< int >::type Nh_eff(Nh_effSEXP);
+    Rcpp::traits::input_parameter< double >::type logpmin(logpminSEXP);
+    Rcpp::traits::input_parameter< double >::type logpmax_fixed(logpmax_fixedSEXP);
+    Rcpp::traits::input_parameter< double >::type dh(dhSEXP);
+    Rcpp::traits::input_parameter< int >::type n_perm(n_permSEXP);
+    Rcpp::traits::input_parameter< Nullable<NumericVector> >::type voxel_weights(voxel_weightsSEXP);
+    rcpp_result_gen = Rcpp::wrap(calibrate_fwer_signflip_cpp(data4d, mask, nx, ny, nz, nt, center_residuals, V, Rd, ZestThr, connectivity, sided_mode, use_legacy, Nh_eff, logpmin, logpmax_fixed, dh, n_perm, voxel_weights));
+    return rcpp_result_gen;
+END_RCPP
+}
 
 static const R_CallMethodDef CallEntries[] = {
     {"_pTFCE_es_cpp", (DL_FUNC) &_pTFCE_es_cpp, 3},
@@ -103,6 +159,8 @@ static const R_CallMethodDef CallEntries[] = {
     {"_pTFCE_dvox_clust_cpp", (DL_FUNC) &_pTFCE_dvox_clust_cpp, 5},
     {"_pTFCE_ptfce_tail_cpp", (DL_FUNC) &_pTFCE_ptfce_tail_cpp, 14},
     {"_pTFCE_smoothest_cpp", (DL_FUNC) &_pTFCE_smoothest_cpp, 9},
+    {"_pTFCE_calibrate_fwer_grf_cpp", (DL_FUNC) &_pTFCE_calibrate_fwer_grf_cpp, 17},
+    {"_pTFCE_calibrate_fwer_signflip_cpp", (DL_FUNC) &_pTFCE_calibrate_fwer_signflip_cpp, 19},
     {NULL, NULL, 0}
 };
 

@@ -43,10 +43,9 @@ NULL
 #' @param connectivity Voxel neighborhood connectivity in 3D: \code{6} (faces touch, default;
 #'   AFNI NN=1), \code{18} (faces or edges touch; AFNI NN=2), or \code{26} (faces, edges,
 #'   or corners touch; AFNI NN=3).
-#' @param fwe_p Numeric vector of Family-Wise Error Rate alpha levels for which GRF
-#'   Z-score thresholds are computed (default: \code{0.05}). In \code{sided = "two.sided"}
-#'   mode, each tail is controlled at \code{fwe_p / 2} so \code{abs(Z) >= fwe.Z} controls
-#'   two-sided FWER at \code{fwe_p}.
+#' @param fwe_p Numeric vector of Family-Wise Error Rate alpha levels for which
+#'   Z-score thresholds are computed (default: \code{0.05}). When \code{sided = "two.sided"},
+#'   thresholding at \code{abs(Z) >= fwe.Z} controls two-sided FWER at \code{fwe_p}.
 #' @param legacy Logical; if \code{TRUE}, uses upstream \code{Nh}-point discrete summation
 #'   from \code{logpmin} to \code{logpmax} instead of analytical sub-\code{ZestThr}
 #'   integration with fixed \code{dh} (default: \code{FALSE}).
@@ -62,6 +61,28 @@ NULL
 #' @param smooth_fwhm Numeric scalar; spatial Gaussian smoothing FWHM in voxels applied
 #'   within the mask to regularize voxelwise derivative statistics when estimating
 #'   non-stationary smoothness (default: \code{3.0}; Salimi-Khorshidi et al., 2011).
+#' @param fwe_method Method used to compute FWER-corrected Z-score thresholds
+#'   (\code{fwer0.05.Z} and \code{fwe.Z}):
+#'   \itemize{
+#'     \item \code{"grf"} (default): Fast analytical Gaussian Random Field Euler
+#'       characteristic threshold from \code{number_of_resels} via \code{\link{fwe.p2z}}.
+#'       Conservative on pTFCE-enhanced maps because pTFCE smooths supra-threshold peaks.
+#'     \item \code{"grf_sim"}: Parametric GRF Monte Carlo simulation (\code{n_perm} null
+#'       replicates) synthesized on the exact \code{mask} geometry with stationary
+#'       anisotropic or multi-scale non-stationary smoothness and enhanced by the exact
+#'       same pTFCE operator.
+#'     \item \code{"sign_flip"}: Nonparametric Rademacher (\eqn{\pm 1}) sign-flipping
+#'       calibration (\code{n_perm} replicates) across 4D subject-level contrasts
+#'       (\code{copes}) or 4D GLM residuals (\code{residual}), preserving empirical
+#'       spatial covariance, non-stationarity, and heavy-tailed noise structure.
+#'   }
+#'   Supplying \code{copes} automatically selects \code{fwe_method = "sign_flip"} unless
+#'   \code{fwe_method} is explicitly specified.
+#' @param n_perm Integer number of Monte Carlo replicates used when
+#'   \code{fwe_method = "grf_sim"} or \code{"sign_flip"} (default: \code{500L}).
+#' @param copes Optional 4D image (or NIfTI file path) of independent subject-level
+#'   contrast / COPE volumes for group-level Rademacher sign-flipping FWER calibration
+#'   (and automatic 4D residual smoothness estimation when \code{residual} is omitted).
 #'
 #' @details
 #' By default (\code{legacy = FALSE}, \code{Nh = NULL}), \code{ptfce()} evaluates the
@@ -82,11 +103,20 @@ NULL
 #' }
 #'
 #' When \code{nonstationary = TRUE} (ideally paired with 4D \code{residual} and \code{dof},
-#' or a precomputed \code{local_smoothness} map), each supra-threshold cluster's extent is
-#' measured in local resel-scaled voxel units \eqn{\tilde{c}(\mathcal{C}) = \sum_{v \in \mathcal{C}} w(v)}
-#' rather than raw voxel count. Smooth brain regions (\eqn{w(v) < 1}) are appropriately
-#' tempered against noise-blob inflation, while rougher regions (\eqn{w(v) > 1}, e.g.
-#' subcortex) gain sensitivity for compact true signals.
+#' 4D \code{copes}, or a precomputed \code{local_smoothness} map), each supra-threshold
+#' cluster's extent is measured in local resel-scaled voxel units
+#' \eqn{\tilde{c}(\mathcal{C}) = \sum_{v \in \mathcal{C}} w(v)} rather than raw voxel count.
+#' Smooth brain regions (\eqn{w(v) < 1}) are appropriately tempered against noise-blob
+#' inflation, while rougher regions (\eqn{w(v) > 1}, e.g. subcortex) gain sensitivity for
+#' compact true signals.
+#'
+#' Because the pTFCE-enhanced field is smoother than the raw input Z-map, the classical
+#' raw-field Euler characteristic formula (\code{fwe_method = "grf"}) is conservative
+#' (typical empirical FWER \eqn{\approx 0.005\text{--}0.015} at nominal \eqn{\alpha = 0.05}).
+#' Setting \code{fwe_method = "grf_sim"} or \code{fwe_method = "sign_flip"} calibrates the
+#' exact distribution of \eqn{\max_{v \in \mathcal{M}} \tilde{Z}(v)} (or
+#' \eqn{\max_{v \in \mathcal{M}} |\tilde{Z}(v)|} in \code{"two.sided"} mode) via a fast
+#' lookup-table-accelerated C++ engine, recovering full nominal statistical power.
 #'
 #' @return An object of class \code{"ptfce"} (a list) containing:
 #' \itemize{
@@ -94,13 +124,17 @@ NULL
 #'   \item \strong{logp}: Negative natural logarithm \code{-log(p)} of enhanced p-values.
 #'   \item \strong{Z}: Enhanced Z-score image (signed when \code{sided = "two.sided"}).
 #'   \item \strong{number_of_resels}: Estimated number of resels in the mask.
-#'   \item \strong{fwer0.05.Z}: GRF FWER Z-score threshold at \code{alpha = 0.05}
-#'     (adjusted to \code{0.025} per tail when \code{sided = "two.sided"}).
-#'   \item \strong{fwe.Z}: Named numeric vector of GRF FWER Z-score thresholds corresponding
+#'   \item \strong{fwer0.05.Z}: FWER Z-score threshold at \code{alpha = 0.05}.
+#'   \item \strong{fwe.Z}: Named numeric vector of FWER Z-score thresholds corresponding
 #'     to \code{fwe_p}.
 #'   \item \strong{sided}: Enhancement sidedness used.
 #'   \item \strong{nonstationary}: Logical indicating whether non-stationary smoothness
 #'     adjustment was applied.
+#'   \item \strong{fwe_method}: FWER calibration method used (\code{"grf"},
+#'     \code{"grf_sim"}, or \code{"sign_flip"}).
+#'   \item \strong{null_max_Z}: Numeric vector of length \code{n_perm} containing the
+#'     simulated null maximum enhanced Z-scores when \code{fwe_method != "grf"}
+#'     (\code{NULL} when \code{fwe_method = "grf"}).
 #' }
 #'
 #' @export
@@ -111,10 +145,17 @@ NULL
 #' res <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
 #'              residual = "res4d.nii.gz", dof = 42, sided = "two.sided")
 #'
-#' # With non-stationary smoothness adjustment from 4D residuals:
-#' res_ns <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
-#'                 residual = "res4d.nii.gz", dof = 42,
-#'                 sided = "two.sided", nonstationary = TRUE)
+#' # Non-stationary pTFCE with parametric GRF simulation FWER calibration:
+#' res_sim <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
+#'                  residual = "res4d.nii.gz", dof = 42,
+#'                  sided = "two.sided", nonstationary = TRUE,
+#'                  fwe_method = "grf_sim", n_perm = 500)
+#'
+#' # Group-level non-stationary pTFCE with Rademacher sign-flipping calibration:
+#' res_sf <- ptfce("zstat1.nii.gz", mask = "mask.nii.gz",
+#'                 copes = "all_copes_4d.nii.gz",
+#'                 sided = "two.sided", nonstationary = TRUE,
+#'                 fwe_method = "sign_flip", n_perm = 500)
 #' }
 ptfce <- function(img,
                   mask = NULL,
@@ -135,14 +176,31 @@ ptfce <- function(img,
                   legacy = FALSE,
                   nonstationary = FALSE,
                   local_smoothness = NULL,
-                  smooth_fwhm = 3.0) {
+                  smooth_fwhm = 3.0,
+                  fwe_method = c("grf", "grf_sim", "sign_flip"),
+                  n_perm = 500L,
+                  copes = NULL) {
   sided <- match.arg(sided)
+  if (!is_missing_arg(copes) && missing(fwe_method)) {
+    fwe_method <- "sign_flip"
+  } else {
+    fwe_method <- match.arg(fwe_method)
+  }
   if (!is_missing_arg(local_smoothness) && missing(nonstationary)) {
     nonstationary <- TRUE
   }
   nonstationary <- isTRUE(nonstationary)
   if (!is.numeric(smooth_fwhm) || length(smooth_fwhm) != 1L || !is.finite(smooth_fwhm) || smooth_fwhm < 0) {
     stop("`smooth_fwhm` must be a non-negative finite number.", call. = FALSE)
+  }
+  if (!is.numeric(fwe_p) || length(fwe_p) < 1L || any(is.na(fwe_p)) || any(fwe_p <= 0 | fwe_p >= 1)) {
+    stop("`fwe_p` must be a numeric vector of alpha levels strictly in (0, 1).", call. = FALSE)
+  }
+  if (fwe_method != "grf") {
+    n_perm <- as.integer(n_perm)[1L]
+    if (is.na(n_perm) || n_perm < 19L) {
+      stop("`n_perm` must be an integer >= 19 when `fwe_method` is 'grf_sim' or 'sign_flip'.", call. = FALSE)
+    }
   }
 
   connectivity <- as.integer(connectivity)
@@ -205,6 +263,34 @@ ptfce <- function(img,
   autosmooth <- FALSE
   voxel_weights <- NULL
   smooth_computed <- NULL
+  copes_meta <- NULL
+  res_meta <- NULL
+
+  if (!is_missing_arg(copes)) {
+    copes_meta <- read_volume_input(copes, arg_name = "copes", allow_4d = TRUE)
+    if (!identical(copes_meta$dim3, d3)) {
+      stop(sprintf("`copes` spatial dimensions (%s) do not match `img` dimensions (%s).",
+                   paste(copes_meta$dim3, collapse = "x"), paste(d3, collapse = "x")), call. = FALSE)
+    }
+    if (copes_meta$nt < 2L) {
+      stop("`copes` must be a 4D image with at least 2 subject/contrast volumes.", call. = FALSE)
+    }
+    if (fwe_method == "sign_flip" && copes_meta$nt < 6L) {
+      stop("`fwe_method = \"sign_flip\"` requires at least 6 volumes in `copes`.", call. = FALSE)
+    }
+  } else if (fwe_method == "sign_flip") {
+    if (is_missing_arg(residual)) {
+      stop("`fwe_method = \"sign_flip\"` requires either a 4D `copes` image or a 4D `residual` image.", call. = FALSE)
+    }
+    res_meta <- read_volume_input(residual, arg_name = "residual", allow_4d = TRUE)
+    if (!identical(res_meta$dim3, d3)) {
+      stop(sprintf("`residual` spatial dimensions (%s) do not match `img` dimensions (%s).",
+                   paste(res_meta$dim3, collapse = "x"), paste(d3, collapse = "x")), call. = FALSE)
+    }
+    if (res_meta$nt < 6L) {
+      stop("`fwe_method = \"sign_flip\"` requires a 4D `residual` image with at least 6 volumes.", call. = FALSE)
+    }
+  }
 
   # If a precomputed smoothest(..., nonstationary = TRUE) list was supplied, reuse its parameters if needed
   if (is.list(local_smoothness) && all(c("volume", "dLh", "resels") %in% names(local_smoothness))) {
@@ -225,9 +311,10 @@ ptfce <- function(img,
     autosmooth <- TRUE
     need_local_here <- nonstationary && is_missing_arg(local_smoothness)
     if (!is_missing_arg(residual)) {
+      res_for_sm <- if (!is.null(res_meta)) res_meta$data else residual
       if (!is_missing_arg(dof)) {
         smooth_computed <- smoothest(
-          residual, mask_clean, dof = dof, verbose = verbose,
+          res_for_sm, mask_clean, dof = dof, verbose = verbose,
           nonstationary = need_local_here, smooth_fwhm = smooth_fwhm
         )
       } else {
@@ -240,6 +327,12 @@ ptfce <- function(img,
           nonstationary = need_local_here, smooth_fwhm = if (need_local_here) max(smooth_fwhm, 4.0) else smooth_fwhm
         )
       }
+    } else if (!is.null(copes_meta)) {
+      dof_copes <- if (!is_missing_arg(dof)) as.numeric(dof)[1L] else as.numeric(copes_meta$nt - 1L)
+      smooth_computed <- smoothest(
+        copes_meta$data, mask_clean, dof = dof_copes, verbose = verbose,
+        nonstationary = need_local_here, smooth_fwhm = smooth_fwhm
+      )
     } else {
       if (need_local_here) {
         warning("`nonstationary = TRUE` without 4D `residual` or `local_smoothness`: estimating local smoothness from 3D Z-map is noisy and signal-sensitive; 4D residuals are strongly recommended.")
@@ -291,7 +384,12 @@ ptfce <- function(img,
     } else {
       # User supplied explicit V and Rd, plus nonstationary = TRUE without local_smoothness
       if (!is_missing_arg(residual) && !is_missing_arg(dof)) {
-        sm_loc <- smoothest(residual, mask_clean, dof = dof, verbose = verbose,
+        res_for_sm <- if (!is.null(res_meta)) res_meta$data else residual
+        sm_loc <- smoothest(res_for_sm, mask_clean, dof = dof, verbose = verbose,
+                            nonstationary = TRUE, smooth_fwhm = smooth_fwhm)
+      } else if (!is.null(copes_meta)) {
+        dof_copes <- if (!is_missing_arg(dof)) as.numeric(dof)[1L] else as.numeric(copes_meta$nt - 1L)
+        sm_loc <- smoothest(copes_meta$data, mask_clean, dof = dof_copes, verbose = verbose,
                             nonstationary = TRUE, smooth_fwhm = smooth_fwhm)
       } else {
         warning("`nonstationary = TRUE` without 4D `residual` or `local_smoothness`: estimating local smoothness from 3D Z-map is noisy and signal-sensitive; 4D residuals are strongly recommended.")
@@ -299,6 +397,7 @@ ptfce <- function(img,
                             nonstationary = TRUE, smooth_fwhm = max(smooth_fwhm, 4.0))
       }
       voxel_weights <- normalize_local_weights(as.numeric(sm_loc$voxel_weights))
+      if (is.null(smooth_computed)) smooth_computed <- sm_loc
     }
   }
 
@@ -499,21 +598,151 @@ ptfce <- function(img,
     }
   }
 
-  # Compute GRF FWER thresholds
+  # Compute number_of_resels (when available) and FWER Z-score thresholds
   if (autosmooth || !is_missing_arg(resels)) {
     resels_val <- as.numeric(resels)[1L]
     number_of_resels <- V / resels_val
-    alpha_scale <- if (sided == "two.sided") 0.5 else 1.0
-    fwer0.05.Z <- fwe.p2z(number_of_resels, 0.05 * alpha_scale)
-    fwe_Z <- stats::setNames(
-      fwe.p2z(number_of_resels, fwe_p * alpha_scale),
-      format(fwe_p, trim = TRUE)
-    )
   } else {
-    warning("For GRF-based FWER correction, please specify `resels` or allow automatic smoothness estimation.")
     number_of_resels <- NA_real_
-    fwer0.05.Z <- NA_real_
-    fwe_Z <- stats::setNames(rep(NA_real_, length(fwe_p)), format(fwe_p, trim = TRUE))
+  }
+
+  null_max_Z <- NULL
+
+  if (fwe_method == "grf") {
+    if (!is.na(number_of_resels)) {
+      alpha_scale <- if (sided == "two.sided") 0.5 else 1.0
+      fwer0.05.Z <- fwe.p2z(number_of_resels, 0.05 * alpha_scale)
+      fwe_Z <- stats::setNames(
+        fwe.p2z(number_of_resels, fwe_p * alpha_scale),
+        format(fwe_p, trim = TRUE)
+      )
+    } else {
+      warning("For GRF-based FWER correction, please specify `resels` or allow automatic smoothness estimation.")
+      fwer0.05.Z <- NA_real_
+      fwe_Z <- stats::setNames(rep(NA_real_, length(fwe_p)), format(fwe_p, trim = TRUE))
+    }
+  } else {
+    sided_int <- switch(sided, "positive" = 0L, "negative" = 1L, "two.sided" = 2L)
+    Nh_pass <- if (use_legacy) Nh_eff else 100L
+    lpmax_pass <- if (use_legacy && !is.null(logpmax)) as.numeric(logpmax)[1L] else NA_real_
+    dh_pass <- if (use_legacy) dh_legacy else as.numeric(dh)[1L]
+
+    if (fwe_method == "grf_sim") {
+      if (verbose) {
+        cat(sprintf("* Calibrating FWER threshold via parametric GRF simulation (B = %d)...\n", n_perm))
+      }
+      sigmasq_base <- NULL
+      if (!is.null(smooth_computed) && !is.null(smooth_computed$sigmasq)) {
+        sigmasq_base <- as.numeric(smooth_computed$sigmasq)
+      } else if (is.list(local_smoothness) && !is.null(local_smoothness$sigmasq)) {
+        sigmasq_base <- as.numeric(local_smoothness$sigmasq)
+      }
+      if (is.null(sigmasq_base) || length(sigmasq_base) < 3L || !all(is.finite(sigmasq_base[1:2]))) {
+        dlh_iso <- Rd / V
+        if (d3[3L] > 1L) {
+          s2_iso <- 0.5 * (dlh_iso^(-2.0 / 3.0))
+          sigmasq_base <- c(s2_iso, s2_iso, s2_iso)
+        } else {
+          s2_iso <- 0.5 / dlh_iso
+          sigmasq_base <- c(s2_iso, s2_iso, 0.0)
+        }
+      }
+
+      null_max_Z <- calibrate_fwer_grf_cpp(
+        mask = inside,
+        nx = d3[1L],
+        ny = d3[2L],
+        nz = d3[3L],
+        V = V,
+        Rd = Rd,
+        sigmasq_base = sigmasq_base,
+        ZestThr = ZestThr,
+        connectivity = connectivity,
+        sided_mode = sided_int,
+        use_legacy = use_legacy,
+        Nh_eff = Nh_pass,
+        logpmin = as.numeric(logpmin)[1L],
+        logpmax_fixed = lpmax_pass,
+        dh = dh_pass,
+        n_perm = n_perm,
+        voxel_weights = voxel_weights
+      )
+    } else {
+      # fwe_method == "sign_flip"
+      use_copes_sf <- !is.null(copes_meta)
+      sf_meta <- if (use_copes_sf) copes_meta else res_meta
+      if (verbose) {
+        src_lbl <- if (use_copes_sf) "4D copes" else "4D residuals"
+        cat(sprintf("* Calibrating FWER threshold via Rademacher sign-flipping (%s, B = %d)...\n",
+                    src_lbl, n_perm))
+      }
+
+      sf_res <- calibrate_fwer_signflip_cpp(
+        data4d = sf_meta$data,
+        mask = inside,
+        nx = d3[1L],
+        ny = d3[2L],
+        nz = d3[3L],
+        nt = sf_meta$nt,
+        center_residuals = !use_copes_sf,
+        V = V,
+        Rd = Rd,
+        ZestThr = ZestThr,
+        connectivity = connectivity,
+        sided_mode = sided_int,
+        use_legacy = use_legacy,
+        Nh_eff = Nh_pass,
+        logpmin = as.numeric(logpmin)[1L],
+        logpmax_fixed = lpmax_pass,
+        dh = dh_pass,
+        n_perm = n_perm,
+        voxel_weights = voxel_weights
+      )
+
+      if (!use_copes_sf && is.finite(sf_res$mean_temp_ar1) && abs(sf_res$mean_temp_ar1) > 0.25) {
+        warning(sprintf(
+          paste0("Substantial lag-1 autocorrelation (r = %.2f) detected along the 4th dimension ",
+                 "of `residual`. Rademacher sign-flipping assumes independent/exchangeable volumes ",
+                 "(e.g., group-level subjects or prewhitened residuals); consider `fwe_method = \"grf_sim\"` ",
+                 "for unwhitened time series."),
+          sf_res$mean_temp_ar1
+        ))
+      }
+      null_max_Z <- sf_res$null_max_Z
+    }
+
+    m_sorted <- sort(as.numeric(null_max_Z), decreasing = FALSE)
+    B_eff <- length(m_sorted)
+    if (B_eff < 1L || anyNA(m_sorted)) {
+      stop("Empirical FWER calibration produced invalid null maximum statistics.", call. = FALSE)
+    }
+
+    # Exact finite-sample Monte Carlo quantile M_(ceiling((1 - alpha) * (B + 1)))
+    # guarantees P_H0(max_Z > thr) <= alpha by exchangeability (Phipson & Smyth, 2010).
+    emp_p2z <- function(alphas, warn_small = TRUE) {
+      res_z <- numeric(length(alphas))
+      for (idx_a in seq_along(alphas)) {
+        a <- alphas[idx_a]
+        if ((B_eff + 1.0) * a < 1.0 - 1e-12) {
+          if (warn_small) {
+            warning(sprintf(
+              paste0("`n_perm = %d` is too small for `fwe_p = %g` ((n_perm + 1) * alpha < 1); ",
+                     "using maximum simulated null statistic. Increase `n_perm >= %d`."),
+              B_eff, a, as.integer(ceiling(1.0 / a - 1.0))
+            ))
+          }
+          res_z[idx_a] <- m_sorted[B_eff]
+        } else {
+          j <- as.integer(ceiling((1.0 - a) * (B_eff + 1.0) - 1e-12))
+          j <- min(B_eff, max(1L, j))
+          res_z[idx_a] <- m_sorted[j]
+        }
+      }
+      res_z
+    }
+
+    fwer0.05.Z <- emp_p2z(0.05, warn_small = FALSE)
+    fwe_Z <- stats::setNames(emp_p2z(fwe_p, warn_small = TRUE), format(fwe_p, trim = TRUE))
   }
 
   out <- list(
@@ -524,7 +753,9 @@ ptfce <- function(img,
     fwer0.05.Z = fwer0.05.Z,
     fwe.Z = fwe_Z,
     sided = sided,
-    nonstationary = nonstationary
+    nonstationary = nonstationary,
+    fwe_method = fwe_method,
+    null_max_Z = null_max_Z
   )
   class(out) <- "ptfce"
   out
@@ -533,9 +764,14 @@ ptfce <- function(img,
 #' @export
 print.ptfce <- function(x, ...) {
   ns_lbl <- if (isTRUE(x$nonstationary)) ", non-stationary" else ""
+  fwe_lbl <- if (!is.null(x$fwe_method) && x$fwe_method != "grf") {
+    sprintf(" [%s, B=%d]", x$fwe_method, length(x$null_max_Z))
+  } else {
+    " [GRF]"
+  }
   cat("pTFCE result (", x$sided, ns_lbl, ")\n", sep = "")
   cat("  Number of resels : ", format(x$number_of_resels, digits = 5), "\n", sep = "")
-  cat("  FWER 0.05 Z-thr  : ", format(x$fwer0.05.Z, digits = 5), "\n", sep = "")
+  cat("  FWER 0.05 Z-thr  : ", format(x$fwer0.05.Z, digits = 5), fwe_lbl, "\n", sep = "")
   invisible(x)
 }
 
