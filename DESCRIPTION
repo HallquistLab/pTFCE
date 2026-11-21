@@ -6,7 +6,7 @@ Authors@R: c(
     person("Michael", "Hallquist", email = "michael.hallquist@gmail.com", role = c("ctb", "cre"))
   )
 Description: The threshold-free cluster enhancement (TFCE) approach integrates cluster information into voxel-wise statistical inference to enhance detectability of neuroimaging signal. Probabilistic TFCE (pTFCE) provides a general Bayesian and Gaussian Random Field (GRF) framework for topology-based belief boosting across cluster-forming thresholds, directly producing enhanced p-values and Z-scores without requiring permutation testing. This fork provides a fast C++ (Rcpp) connected-component and log-space numerical integration engine, native bi-sided (two-tailed) enhancement without cross-tail grid asymmetry or cluster-border NaN artifacts, fast 3D/4D smoothness estimation with optional non-stationary local roughness adjustment, fast parametric GRF simulation and Rademacher sign-flipping FWER threshold calibration, and flexible NIfTI/array input support.
-URL: https://github.com/HallquistLab/pTFCE, https://github.com/spisakt/pTFCE
+URL: https://hallquistlab.github.io/pTFCE/, https://github.com/HallquistLab/pTFCE, https://github.com/spisakt/pTFCE
 BugReports: https://github.com/HallquistLab/pTFCE/issues
 Depends: R (>= 3.5.0)
 License: GPL (>= 3) + file LICENSE

@@ -1,0 +1,50 @@
+url: https://hallquistlab.github.io/pTFCE/
+destination: _site
+
+template:
+  bootstrap: 5
+  bootswatch: cosmo
+
+home:
+  title: "pTFCE: Probabilistic Threshold-Free Cluster Enhancement"
+  description: >
+    Fast Rcpp implementation of Probabilistic Threshold-Free Cluster Enhancement
+    for neuroimaging with native bi-sided inference, non-stationary smoothness
+    adjustment, and empirical FWER calibration.
+
+navbar:
+  structure:
+    left:  [intro, report, reference, news]
+    right: [search, github]
+  components:
+    intro:
+      text: "Practitioner's Guide"
+      href: articles/ptfce-fmri-guide.html
+    report:
+      text: "Technical Report (Departures)"
+      href: fork_modifications_report.html
+    reference:
+      text: "Reference"
+      href: reference/index.html
+    news:
+      text: "Changelog"
+      href: news/index.html
+    github:
+      icon: fab fa-github fa-lg
+      href: https://github.com/HallquistLab/pTFCE/
+      aria-label: GitHub repository
+
+reference:
+  - title: "Core Enhancement & Smoothness"
+    desc: "Primary entry points for pTFCE enhancement, 2D/3D/4D smoothness estimation, and t-to-Z conversion."
+    contents:
+      - ptfce
+      - smoothest
+      - t2z
+  - title: "GRF Theory & FWER Utilities"
+    desc: "Gaussian Random Field Euler characteristic FWER conversions and cluster-size helpers."
+    contents:
+      - fwe.p2z
+      - fwe.z2p
+      - Es
+      - aggregate_logpvals

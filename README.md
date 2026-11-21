@@ -2,10 +2,10 @@
 
 High-performance fork of [`spisakt/pTFCE`](https://github.com/spisakt/pTFCE) implementing **Probabilistic Threshold-Free Cluster Enhancement** (Spisák et al., 2019) with a fast C++ (`Rcpp`) engine, exact log-space posterior quadrature, and native bi-sided (two-tailed) fMRI inference.
 
-> **Documentation & Simulation Studies:**
-> - **Practitioner's Guide & Simulation Walkthrough (R Vignette):** [`vignettes/ptfce-fmri-guide.Rmd`](vignettes/ptfce-fmri-guide.Rmd) — accessible conceptual overview, visual examples, Monte Carlo simulation results, and copy-paste recipes for FSL, SPM, and AFNI (`vignette("ptfce-fmri-guide", package = "pTFCE")`).
-> - **Technical Departure Report:** [`docs/fork_modifications_report.qmd`](docs/fork_modifications_report.qmd) — mathematical derivations, C++ architecture, and complete departure log from upstream `spisakt/pTFCE` (`v0.2.2.1`).
-> - **Reproducible Benchmark Suite:** [`docs/benchmarks/run_simulation_studies.R`](docs/benchmarks/run_simulation_studies.R).
+> **Documentation Website & Simulation Studies (`https://hallquistlab.github.io/pTFCE/`):**
+> - **Practitioner's Guide & Simulation Walkthrough:** [Rendered HTML Vignette](https://hallquistlab.github.io/pTFCE/articles/ptfce-fmri-guide.html) ([source `.Rmd`](vignettes/ptfce-fmri-guide.Rmd)) — conceptual overview, visual examples, Monte Carlo simulation results, and copy-paste recipes for FSL, SPM, and AFNI.
+> - **Technical Departure Report:** [Rendered Quarto Report](https://hallquistlab.github.io/pTFCE/fork_modifications_report.html) ([source `.qmd`](docs/fork_modifications_report.qmd)) — mathematical derivations, C++ architecture, and complete departure log from upstream `spisakt/pTFCE` (`v0.2.2.1`).
+> - **Function Reference & Changelog:** [API Reference](https://hallquistlab.github.io/pTFCE/reference/index.html) | [Changelog](https://hallquistlab.github.io/pTFCE/news/index.html) | [Reproducible Benchmark Suite (`run_simulation_studies.R`)](docs/benchmarks/run_simulation_studies.R).
 
 ## Installation
 

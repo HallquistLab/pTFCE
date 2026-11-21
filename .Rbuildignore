@@ -8,3 +8,6 @@
 ^index\.md$
 ^run_ptfce_R\.sh$
 ^docs$
+^_pkgdown\.yml$
+^_site$
+^\.github$
