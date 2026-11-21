@@ -318,6 +318,15 @@ ggplot(df_prof, aes(x = x, y = Z, color = Curve, linetype = Curve)) +
   theme(legend.position = "bottom")
 ```
 
+### Monte Carlo Evaluation of Regional False-Positive Parity (`v0.4.0`)
+
+In 3D group-fMRI null simulations ($R = 250$ studies, $N = 30$ subjects; `42 x 32 x 22` search volume spanning subcortex `FWHM = 3.0`, lateral cortex `FWHM = 4.8`, and medial DMN `FWHM = 7.2` voxels; reproducible via [`docs/benchmarks/run_simulation_studies.R`](benchmarks/run_simulation_studies.R) and summarized in user vignette `vignettes/ptfce-fmri-guide.Rmd`), stationary pTFCE exhibits a **17.8$\times$** false-positive disparity across smoothness zones, which `nonstationary = TRUE` collapses to **1.1$\times$**:
+
+| Enhancement Mode | Rough Subcortex (`FWHM = 3.0`) $p < 0.001$ Rate ($\times 10^{-3}$) | Moderate Cortex (`FWHM = 4.8`) $p < 0.001$ Rate ($\times 10^{-3}$) | Smooth Medial DMN (`FWHM = 7.2`) $p < 0.001$ Rate ($\times 10^{-3}$) | Smooth / Rough Disparity |
+| :--- | :---: | :---: | :---: | :---: |
+| Stationary pTFCE (`nonstationary = FALSE`) | `0.106` | `0.538` | `1.889` | **17.8$\times$** |
+| **Non-Stationary pTFCE (`nonstationary = TRUE`)** | **`0.307`** | **`0.366`** | **`0.338`** | **1.1$\times$** |
+
 ---
 
 ## Empirical FWER Threshold Calibration (`v0.4.1`): `grf_sim` vs. `sign_flip`

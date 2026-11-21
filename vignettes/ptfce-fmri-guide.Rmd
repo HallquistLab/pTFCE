@@ -1,0 +1,325 @@
+---
+title: "Practical Guide to Bi-Sided, Non-Stationary, and FWER-Calibrated pTFCE for fMRI"
+author: "Michael Hallquist"
+date: "`r Sys.Date()`"
+output:
+  rmarkdown::html_vignette:
+    toc: true
+    toc_depth: 3
+vignette: >
+  %\VignetteIndexEntry{Practical Guide to Bi-Sided, Non-Stationary, and FWER-Calibrated pTFCE for fMRI}
+  %\VignetteEngine{knitr::rmarkdown}
+  %\VignetteEncoding{UTF-8}
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(
+  collapse = TRUE,
+  comment = "#>",
+  fig.width = 7,
+  fig.height = 4.2
+)
+library(pTFCE)
+```
+
+## 1. Overview: Why pTFCE and What This Package Adds
+
+**Probabilistic Threshold-Free Cluster Enhancement (pTFCE; Spisák et al., 2019)** boosts statistical sensitivity in neuroimaging by combining voxel intensity and supra-threshold cluster extent across all cluster-forming thresholds via Bayes' rule and Gaussian Random Field (GRF) theory. Unlike standard TFCE (Smith & Nichols, 2009), whose raw score has arbitrary units and *requires* permutation testing to obtain $p$-values, `pTFCE` outputs calibrated voxelwise $Z$-scores and $p$-values directly on the standard normal scale.
+
+In real-world fMRI analyses, however, three practical limitations arise in standard stationary, one-sided `pTFCE`:
+
+1. **Bi-sided (`+Z` and `-Z`) contrasts:** Running separate positive and negative passes with a fixed number of thresholds (`Nh = 100`) makes the integration step size depend on the strongest peak in each tail. A huge visual or motor peak ($Z = +20$) coarsens the positive grid and suppresses moderate positive clusters relative to negative clusters of the exact same size, while discrete sub-threshold summation creates a ~20% zero "dead zone" around $Z = 0$.
+2. **Spatial smoothness non-stationarity:** Human fMRI smoothness varies 2–3$\times$ in FWHM (8–25$\times$ in 3D resel volume) across anatomy—for example, medial default-mode cortex (precuneus, vmPFC) is much smoother than subcortical nuclei, brainstem, or amygdala. Measuring clusters by raw voxel count over-enhances random smooth-cortex noise blobs while under-enhancing compact subcortical activations.
+3. **Conservative analytical FWER thresholds:** Plugging the *unenhanced* raw image's resel count into the classical Euler characteristic formula (`fwe_method = "grf"`) ignores the topological smoothing induced by pTFCE itself. In 3D group-fMRI simulations, analytical GRF thresholds yield an empirical two-sided FWER of only **0.010–0.015** at nominal $\alpha = 0.05$, sacrificing 35–55% of statistical power.
+
+`HallquistLab/pTFCE` (`v0.4.1`) addresses all three issues atop a fast C++ (`Rcpp`) engine while keeping original upstream behavior available as defaults.
+
+---
+
+## 2. Quick Decision Guide: Which Settings Should I Use?
+
+| Your Available fMRI Inputs | Recommended `ptfce()` Settings | Why This Choice Works Best |
+| :--- | :--- | :--- |
+| **Group GLM with 4D residuals** (`res4d` + `dof`, e.g., FSL `flameo` / `3dttest++ -resid`) | `sided = "two.sided"`, `nonstationary = TRUE`, `fwe_method = "sign_flip"` | **Gold standard.** Equalizes regional false-positive rates across cortex vs. subcortex, calibrates exact FWER ($\approx 0.050$) nonparametrically in ~1–7 s whole-brain, and handles heavy-tailed outliers. |
+| **Group stack of 4D subject contrasts** (`copes` across $N \ge 6$ subjects) | `copes = copes4d`, `sided = "two.sided"`, `nonstationary = TRUE` *(auto-selects `"sign_flip"`)* | Automatically estimates 4D group residual smoothness from centered COPEs (`dof = N - 1`) and runs exact one-sample Rademacher sign-flipping. |
+| **3D `Z`/`t` map + 3D local roughness map** (e.g., SPM `spmT` + `RPV.nii`, no 4D stack) | `local_smoothness = "RPV.nii"`, `sided = "two.sided"`, `fwe_method = "grf_sim"` | Applies non-stationary cluster scaling from `RPV.nii` and calibrates exact pTFCE FWER via multi-scale 3D GRF simulation without needing 4D data. |
+| **Single 3D `Z`-map + mask only** (shared map, meta-analysis, no 4D residuals) | `sided = "two.sided"`, `nonstationary = FALSE`, `fwe_method = "grf_sim"` | Avoids noisy single-map local smoothness estimates while still recovering exact stationary pTFCE FWER power over conservative analytical `"grf"`. |
+| **Ultra-fast screening across hundreds of contrasts** (< 0.5 s per whole-brain map) | Precompute `sm <- smoothest(res4d, mask, dof, nonstationary = TRUE)`, then `fwe_method = "grf"` | Runs in ~0.3–0.7 s per whole-brain bi-sided map; FWER threshold is valid and conservative ($\alpha_{\text{emp}} \approx 0.015$). |
+
+---
+
+## 3. How the Core Features Work
+
+### 3.1 Native Bi-Sided Enhancement (`sided = "two.sided"`)
+
+By default (`dh = 0.05`, `legacy = FALSE`), `ptfce()` integrates the unenhanced sub-threshold region $|Z| \le Z_{\text{estThr}}$ ($1.3$) analytically in closed form and uses a **fixed integration step** $\Delta(-\log p) = 0.05$ above $Z_{\text{estThr}}$.
+
+When `sided = "two.sided"`:
+
+- Positive ($Z > 0$) and negative ($Z < 0$) excursion sets are enhanced independently on identical threshold grids, guaranteeing **strict contrast anti-symmetry**: enhancing $-Z$ produces the exact negation $-\tilde{Z}$.
+- Sub-threshold voxels ($|Z| \le 1.3$) retain their exact input $Z$-scores (eliminating the ~20% zero dead-zone around $Z = 0$), and out-of-mask voxels are cleanly `0` in `$Z` and `1` in `$p` (eliminating the legacy `-8.21` background floor).
+- `$Z` stores signed enhanced $Z$-scores; thresholding at `abs(res$Z) >= res$fwer0.05.Z` controls two-sided FWER at $\alpha = 0.05$.
+
+```{r bisided-demo}
+d <- c(22L, 22L, 16L)
+mask <- array(1, dim = d)
+img <- array(0, dim = d)
+
+# Symmetric positive (+3.6) and negative (-3.6) 3x3x3 clusters, plus an extreme +18 focal spike elsewhere
+img[4:6, 10:12, 7:9]  <-  3.6
+img[16:18, 10:12, 7:9] <- -3.6
+img[11, 18, 8] <- 18.0
+
+res_2s <- ptfce(img, mask, V = prod(d), Rd = 400, resels = 25,
+                sided = "two.sided", verbose = FALSE)
+
+# Despite the +18.0 spike in the positive tail, the +3.6 and -3.6 clusters receive identical |Z| boost:
+c(pos_cluster_Z = res_2s$Z[5, 11, 8],
+  neg_cluster_Z = res_2s$Z[17, 11, 8])
+```
+
+### 3.2 Non-Stationary Smoothness Adjustment (`nonstationary = TRUE`)
+
+Under spatial non-stationarity, a 30-voxel cluster in rough subcortex ($\text{FWHM} \approx 3$ voxels; 1 resel $\approx 27$ voxels) spans more than **one full independent resolution element**, whereas a 30-voxel blob in smooth medial cortex ($\text{FWHM} \approx 7.2$ voxels; 1 resel $\approx 373$ voxels) is less than **one-tenth of a resel** and occurs routinely by chance.
+
+Following Worsley et al. (1999) and Salimi-Khorshidi et al. (2011), `smoothest(..., nonstationary = TRUE)` estimates a spatially regularized local roughness map $\widehat{\text{dLh}}(v)$ from 4D residuals (using normalized within-mask 3D Gaussian smoothing at `smooth_fwhm = 3.0` voxels plus mild empirical-Bayes shrinkage) and forms mean-1 voxel weights:
+$$w(v) = \frac{\widehat{\text{dLh}}(v)}{\overline{\text{dLh}}}, \qquad \tilde{c}(\mathcal{C}) = \sum_{v \in \mathcal{C}} w(v)$$
+
+- In **rough subcortical regions** ($w(v) > 1$), compact true clusters accumulate larger effective resel mass $\tilde{c}$ and receive stronger belief boosting.
+- In **smooth cortical regions** ($w(v) < 1$), diffuse noise blobs are down-weighted to their true resel size, preventing false-positive inflation.
+
+```{r nonstat-demo}
+smooth_3d_unit <- function(x, sigma) {
+  rad <- ceiling(3.5 * sigma)
+  k <- exp(-0.5 * ((-rad:rad)^2) / (sigma^2)); k <- k / sqrt(sum(k^2))
+  dm <- dim(x); pd <- dm + 2L * rad
+  pad <- array(rnorm(prod(pd)), dim = pd)
+  pad[(rad + 1):(rad + dm[1]), (rad + 1):(rad + dm[2]), (rad + 1):(rad + dm[3])] <- x
+  y1 <- array(0, dim = c(dm[1], pd[2], pd[3]))
+  for (i in seq_along(k)) y1 <- y1 + k[i] * pad[i:(i + dm[1] - 1), , ]
+  y2 <- array(0, dim = c(dm[1], dm[2], pd[3]))
+  for (i in seq_along(k)) y2 <- y2 + k[i] * y1[, i:(i + dm[2] - 1), ]
+  y3 <- array(0, dim = dm)
+  for (i in seq_along(k)) y3 <- y3 + k[i] * y2[, , i:(i + dm[3] - 1)]
+  y3
+}
+
+set.seed(2026)
+d_ns <- c(32L, 22L, 14L); nt <- 28L; m_ns <- array(1, dim = d_ns)
+res4d <- array(0, dim = c(d_ns, nt))
+for (t in seq_len(nt)) {
+  wn <- array(rnorm(prod(d_ns)), dim = d_ns)
+  vr <- smooth_3d_unit(wn, 0.80) # Left half (x <= 16): rough (FWHM ~ 1.9 vox)
+  vs <- smooth_3d_unit(wn, 2.00) # Right half (x >= 17): smooth (FWHM ~ 4.7 vox)
+  vr[17:32, , ] <- vs[17:32, , ]
+  res4d[, , , t] <- vr
+}
+
+# Identical 27-voxel clusters (Z = 3.4, peak 3.7) in rough (x = 8) vs. smooth (x = 24) halves
+z_in <- array(0, dim = d_ns)
+z_in[7:9, 10:12, 6:8]   <- 3.4; z_in[8, 11, 7]  <- 3.7
+z_in[23:25, 10:12, 6:8] <- 3.4; z_in[24, 11, 7] <- 3.7
+
+fit_st <- ptfce(z_in, m_ns, residual = res4d, dof = nt - 1, sided = "two.sided",
+                nonstationary = FALSE, verbose = FALSE)
+fit_ns <- ptfce(z_in, m_ns, residual = res4d, dof = nt - 1, sided = "two.sided",
+                nonstationary = TRUE, verbose = FALSE)
+
+old_par <- par(mar = c(4, 4, 2.5, 1))
+plot(1:32, z_in[, 11, 7], type = "l", lwd = 2, lty = 3, col = "grey40",
+     ylim = c(0, 5.2), xlab = "X Voxel Coordinate", ylab = "Z-Score along [x, 11, 7]",
+     main = "Stationary vs. Non-Stationary pTFCE on Identical 27-Voxel Clusters")
+lines(1:32, fit_st$Z[, 11, 7], lwd = 2.2, col = "#d95f02")
+lines(1:32, fit_ns$Z[, 11, 7], lwd = 2.2, col = "#1b9e77")
+abline(v = 16.5, lty = 2, col = "grey50")
+text(8.5, 4.9, "Rough Zone (Subcortex-like)", cex = 0.85)
+text(24.5, 4.9, "Smooth Zone (DMN-like)", cex = 0.85)
+legend("bottom", horiz = TRUE, bty = "n", cex = 0.82,
+       legend = c("Raw Input Z", "Stationary pTFCE", "Non-Stationary pTFCE"),
+       col = c("grey40", "#d95f02", "#1b9e77"), lty = c(3, 1, 1), lwd = 2)
+par(old_par)
+```
+
+### 3.3 Empirical FWER Calibration (`"sign_flip"` and `"grf_sim"`)
+
+Why is `fwe_method = "grf"` conservative on pTFCE maps? Because pTFCE aggregates cluster extent across thresholds, smoothing jagged noise spikes into broader domes with far fewer local maxima than a raw Gaussian field, while truncating cluster likelihoods below $Z_{\text{estThr}} = 1.3$. Consequently, the raw-field Euler characteristic threshold (`~4.45–4.55`) sits roughly **0.30–0.40 $Z$-units above** the true 95th percentile of $\max_v |\tilde{Z}(v)|$ under $H_0$.
+
+`v0.4.1` provides two fast C++ calibration options (`n_perm = 500L` default) that share a precomputed 2D posterior lookup table so zero numerical quadrature occurs inside the simulation loop:
+
+1. **`fwe_method = "sign_flip"` (Recommended when 4D `residual` or 4D `copes` are available):**
+   Multiplies independent subject contrast maps (`copes`) or GLM residual volumes (`residual`, projected onto the exact residual subspace via two-pass Modified Gram–Schmidt so regressed nuisance covariates are respected automatically) by random Rademacher signs $s_t \in \{-1, +1\}$, maps the resulting studentized $t$-statistics to $Z$, enhances each null map with the exact same pTFCE settings, and takes the finite-sample order statistic $M_{(\lceil(1-\alpha)(B+1)\rceil)}$.
+2. **`fwe_method = "grf_sim"` (Recommended when only 3D images are available):**
+   Simulates stationary anisotropic or multi-scale non-stationary 3D Gaussian random fields on the exact `mask` geometry with unit marginal variance everywhere, enhances each draw, and extracts the empirical $(1-\alpha)$ maximum threshold.
+
+```{r fwer-demo}
+set.seed(123)
+fit_sim <- ptfce(z_in, m_ns, residual = res4d, dof = nt - 1,
+                 sided = "two.sided", nonstationary = TRUE,
+                 fwe_method = "grf_sim", n_perm = 149L, verbose = FALSE)
+fit_sf  <- ptfce(z_in, m_ns, residual = res4d, dof = nt - 1,
+                 sided = "two.sided", nonstationary = TRUE,
+                 fwe_method = "sign_flip", n_perm = 149L, verbose = FALSE)
+
+d_sim <- density(fit_sim$null_max_Z)
+d_sf  <- density(fit_sf$null_max_Z)
+
+old_par <- par(mar = c(4, 4, 2.5, 1))
+plot(d_sim, lwd = 2.2, col = "#1b9e77",
+     xlim = range(c(d_sim$x, d_sf$x, fit_ns$fwer0.05.Z + 0.15)),
+     ylim = c(0, max(d_sim$y, d_sf$y) * 1.15),
+     xlab = "Null Maximum |Enhanced Z| Across Mask",
+     ylab = "Density",
+     main = "Calibrated Null max |Z| Distributions vs. Analytical GRF Threshold")
+lines(d_sf, lwd = 2.2, col = "#2166ac")
+abline(v = c(fit_ns$fwer0.05.Z, fit_sim$fwer0.05.Z, fit_sf$fwer0.05.Z),
+       col = c("#b22222", "#1b9e77", "#2166ac"), lty = c(2, 3, 4), lwd = 2)
+legend("topright", bty = "n", cex = 0.80,
+       legend = c(
+         sprintf("Analytical GRF thr = %.2f", fit_ns$fwer0.05.Z),
+         sprintf("grf_sim 95%% thr = %.2f", fit_sim$fwer0.05.Z),
+         sprintf("sign_flip 95%% thr = %.2f", fit_sf$fwer0.05.Z)
+       ),
+       col = c("#b22222", "#1b9e77", "#2166ac"), lty = c(2, 3, 4), lwd = 2)
+par(old_par)
+```
+
+Notice in the two figures above: under conservative analytical GRF (`thr = 4.49`), even the rough-zone cluster (`peak Z = 4.29`) would narrowly miss FWER significance, whereas under calibrated `sign_flip` / `grf_sim` (`thr ~ 4.10`), the rough-zone cluster is clearly detected while the smooth-zone noise-like cluster (`peak Z = 3.84`) remains properly sub-threshold!
+
+---
+
+## 4. Monte Carlo Simulation Study Results
+
+To evaluate these features rigorously under realistic human group-fMRI conditions, we conducted Monte Carlo simulation studies on 3D volumes spanning three smoothly blended anatomical smoothness zones matching empirical group-fMRI residuals (`test03A_res4d`):
+
+- **Zone 1 — Subcortex / Brainstem:** $\text{FWHM} = 3.0$ voxels ($1\text{ resel} = 27\text{ voxels}$)
+- **Zone 2 — Lateral Association Cortex:** $\text{FWHM} = 4.8$ voxels ($1\text{ resel} = 111\text{ voxels}$)
+- **Zone 3 — Medial DMN / Precuneus:** $\text{FWHM} = 7.2$ voxels ($1\text{ resel} = 373\text{ voxels}$, a **13.8$\times$** change in resel volume relative to subcortex)
+
+*(Full simulation scripts are archived in `docs/benchmarks/run_simulation_studies.R` in the GitHub repository.)*
+
+### Study 1: Regional False-Positive Parity Under Non-Stationarity ($R = 250$ Null Group Studies, $N = 30$)
+
+Under the global null, every anatomical zone should exhibit the same voxelwise false-positive rate. Under stationary pTFCE, however, smooth-zone noise blobs contain many raw voxels and receive inflated cluster boosts:
+
+| Enhancement Mode | Subcortex (`FWHM = 3.0`) $p < 0.001$ Rate ($\times 10^{-3}$) | Lateral Cortex (`FWHM = 4.8`) $p < 0.001$ Rate ($\times 10^{-3}$) | Medial DMN (`FWHM = 7.2`) $p < 0.001$ Rate ($\times 10^{-3}$) | Smooth / Rough Disparity Ratio |
+| :--- | :---: | :---: | :---: | :---: |
+| **Stationary pTFCE** (`nonstationary = FALSE`) | `0.106` | `0.538` | `1.889` | **17.8$\times$** |
+| **Non-Stationary pTFCE** (`nonstationary = TRUE`) | **`0.307`** | **`0.366`** | **`0.338`** | **1.1$\times$** |
+
+**Why this matters:** Stationary pTFCE produces nearly **18$\times$ more false-positive excursions** in smooth midline DMN cortex than in rough subcortex. Enabling `nonstationary = TRUE` collapses this regional disparity to **1.1$\times$** across a nearly 14-fold gradient in 3D resel size.
+
+### Study 2: FWER Calibration, Bi-Sided Power, & Heavy-Tailed Robustness ($R = 200$ Null / $150$ Signal Studies, $N = 25$)
+
+In Study 2, true underlying neural parcels in each zone were convolved with that zone's local spatial point-spread function (+4.35 peak expected $Z$ in compact subcortex, +3.75 in lateral cortex, and -3.75 deactivation in medial DMN; nominal two-sided $\alpha = 0.05$, $B = 199$ calibration replicates per study):
+
+| Method | Mean `fwer0.05.Z` | Empirical Null FWER | Subcortex Power (Voxel TPR) | Lat. Cortex Power (Voxel TPR) | Medial DMN Power (Voxel TPR) | Null Smooth-DMN Leakage |
+| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
+| Unenhanced Raw $Z$ + `grf` | `4.453` | `0.016` | 24.0% (3.7%) | 16.7% (1.3%) | 14.0% (1.2%) | 0.0% |
+| Stationary pTFCE + `grf` | `4.452` | `0.010` | 12.7% (1.7%) | 12.7% (2.0%) | 22.7% (6.1%) | 0.0% |
+| Stationary pTFCE + `grf_sim` | `4.094` | `0.065` | 22.7% (3.9%) | 24.0% (4.2%) | 33.3% (9.7%) | 2.7% |
+| Non-Stat pTFCE + `grf` (`v0.4.0`) | `4.502` | `0.015` | 18.0% (3.5%) | 8.0% (1.6%) | 10.0% (1.7%) | 0.0% |
+| **Non-Stat pTFCE + `grf_sim` (`v0.4.1`)** | **`4.135`** | **`0.045`** | **32.0% (7.3%)** | **24.7% (3.4%)** | **18.0% (3.4%)** | **0.0%** |
+| **Non-Stat pTFCE + `sign_flip` (`residual`)** | **`4.141`** | **`0.050`** | **32.7% (7.3%)** | **24.7% (3.3%)** | **18.0% (3.3%)** | **0.0%** |
+| **Non-Stat pTFCE + `sign_flip` (`copes`)** | **`4.142`** | **`0.045`** | **32.7% (7.4%)** | **22.7% (3.4%)** | **16.7% (3.5%)** | **0.0%** |
+
+We also tested robustness under **heavy-tailed / outlier non-Gaussian group noise** ($N = 20$ subjects with $t_{3.5}$ spatial innovations plus random subject-wide variance shocks, nominal FWER $= 0.050$, $R = 200$ studies) and benchmarked wall-clock speed on a high-resolution **301,461-voxel whole-brain fMRI mask** (`test03B_zstat1` + `test03A_res4d`, $T = 25$):
+
+| FWER Calibration Method | Heavy-Tailed Non-Gaussian Null FWER | Standard Group Mask (`~17k` vox, `B = 200`) | High-Res Whole Brain (`301k` vox, `B = 200` / `500`) | Requires 4D Data? |
+| :--- | :---: | :---: | :---: | :---: |
+| `fwe_method = "grf"` (Analytical) | `0.005` *(over-conservative)* | `0.09 s` | `0.70 s` | No |
+| `fwe_method = "grf_sim"` (Parametric GRF) | `0.040` *(mildly conservative)* | `2.1 s` | `42.1 s` / `122.4 s` | **No** (3D-only OK) |
+| `fwe_method = "sign_flip"` (Rademacher) | **`0.065`** *(tracks empirical tail)* | **`0.83 s`** | **`4.3 s` / `7.2 s`** | Yes (`residual` or `copes`) |
+
+### Summary of Findings
+
+1. **Both `sign_flip` and `grf_sim` completely eliminate analytical GRF conservativeness:** Empirical FWER moves from `0.010–0.015` right to nominal **`0.045–0.050`**, increasing subcortical cluster power from `18.0%` (`NS_GRF`) and `24.0%` (`Raw Z`) to **`32.7%`** (doubling voxel sensitivity from `3.7%` to **`7.4%`**) and tripling lateral cortical power from `8.0%` to **`24.7%`**.
+2. **Always pair empirical calibration with `nonstationary = TRUE` when 4D residuals/COPEs or RPV maps exist:** Stationary `grf_sim` (`nonstationary = FALSE`) leaks false positives into smooth DMN cortex (`2.7%` null-DMN false-positive rate, `0.065` whole-brain FWER), whereas `nonstationary = TRUE` + `sign_flip` / `grf_sim` achieves **`0.0%` null-DMN leakage** and exact `0.045–0.050` whole-brain FWER.
+3. **`sign_flip` is ~10$\times$ faster whole-brain and distribution-free; `grf_sim` is the ideal fallback for 3D summary maps:** Because `sign_flip` uses contiguous SIMD matrix-vector products on active mask voxels rather than 3D multi-scale convolutions, it finishes 500 whole-brain replicates across 301k voxels in ~7 seconds.
+
+---
+
+## 5. Copy-Paste Recipes for Standard fMRI Pipelines
+
+### Recipe A: FSL / AFNI Group GLM with 4D Residuals (`res4d`)
+
+```r
+library(pTFCE)
+library(RNifti)
+
+res <- ptfce(
+  img = "zstat1.nii.gz",
+  mask = "mask.nii.gz",
+  residual = "res4d.nii.gz",
+  dof = 42,
+  sided = "two.sided",
+  nonstationary = TRUE,
+  fwe_method = "sign_flip",
+  n_perm = 500L,
+  fwe_p = c(0.05, 0.01)
+)
+
+print(res)
+
+# Save full signed pTFCE Z-map and FWER p < 0.05 thresholded map
+writeNifti(res$Z, "zstat1_ptfce.nii.gz")
+z_sig <- res$Z
+z_sig[abs(z_sig) < res$fwer0.05.Z] <- 0
+writeNifti(z_sig, "zstat1_ptfce_fwep0.05.nii.gz")
+
+# Compute empirical FWER-corrected p-value for any peak Z-score:
+peak_z <- max(abs(res$Z))
+p_fwe_peak <- (1 + sum(res$null_max_Z >= peak_z)) / (length(res$null_max_Z) + 1)
+```
+
+### Recipe B: Group One-Sample / Paired Analysis from 4D Subject Contrasts (`copes`)
+
+```r
+# Given a 4D NIfTI of subject-level contrast images (nx x ny x nz x N_subjects):
+# If starting from a group t-map, convert to Z first via t2z():
+z_obs <- t2z("group_tstat1.nii.gz", dof = 29)
+
+res_cope <- ptfce(
+  img = z_obs,
+  mask = "group_mask.nii.gz",
+  copes = "all_subjects_cope1_4d.nii.gz", # auto-enables sign_flip & 4D smoothness!
+  sided = "two.sided",
+  nonstationary = TRUE,
+  n_perm = 500L
+)
+```
+
+### Recipe C: SPM `spmT` + `RPV.nii` (3D Summary Images Only, No 4D Residuals Saved)
+
+```r
+z_spm <- t2z("spmT_0001.nii", dof = 34)
+
+res_spm <- ptfce(
+  img = z_spm,
+  mask = "mask.nii",
+  local_smoothness = "RPV.nii", # auto-enables nonstationary = TRUE
+  sided = "two.sided",
+  fwe_method = "grf_sim",       # 3D multi-scale GRF simulation (no 4D data needed)
+  n_perm = 500L
+)
+```
+
+### Recipe D: Batching Multiple Contrasts from the Same GLM Model
+
+```r
+# Estimate global + local smoothness from res4d ONCE, then reuse across contrasts:
+sm_ns <- smoothest("res4d.nii.gz", mask = "mask.nii.gz", dof = 42, nonstationary = TRUE)
+
+contrasts <- c("zstat1.nii.gz", "zstat2.nii.gz", "zstat3.nii.gz")
+results <- lapply(contrasts, function(zf) {
+  ptfce(zf, mask = "mask.nii.gz", residual = "res4d.nii.gz", dof = 42,
+        local_smoothness = sm_ns, sided = "two.sided",
+        fwe_method = "sign_flip", n_perm = 500L)
+})
+```
+
+## References
+
+- Spisák, T., Spisák, Z., Zunhammer, M., Bingel, U., Smith, S., Nichols, T., & Kincses, T. (2019). Probabilistic TFCE: a generalized combination of cluster size and voxel intensity to increase statistical power. *NeuroImage*, 185, 12–26.
+- Worsley, K. J., Andermann, M., Koulis, T., MacDonald, D., & Evans, A. C. (1999). Detecting changes in nonisotropic images. *Human Brain Mapping*, 8(2–3), 98–101.
+- Salimi-Khorshidi, G., Smith, S. M., & Nichols, T. E. (2011). Adjusting the effect of nonstationarity in cluster-based and TFCE inference. *NeuroImage*, 54(3), 2006–2019.
+- Winkler, A. M., Ridgway, G. R., Webster, M. A., Smith, S. M., & Nichols, T. E. (2014). Permutation inference for the general linear model. *NeuroImage*, 92, 381–397.

@@ -7,7 +7,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
 
 <meta name="author" content="Hallquist Lab">
-<meta name="dcterms.date" content="2026-11-20">
+<meta name="dcterms.date" content="2026-11-21">
 
 <title>Technical Report: Statistical, Numerical, and Algorithmic Modifications in the HallquistLab/pTFCE Fork</title>
 <style>
@@ -2369,6 +2369,7 @@ window.Quarto = {
   <li><a href="#non-stationary-smoothness-adjustment-v0.4.0-opt-in" id="toc-non-stationary-smoothness-adjustment-v0.4.0-opt-in" class="nav-link" data-scroll-target="#non-stationary-smoothness-adjustment-v0.4.0-opt-in"><span class="header-section-number">6</span> Non-Stationary Smoothness Adjustment (<code>v0.4.0</code>, Opt-In)</a>
   <ul class="collapse">
   <li><a href="#theory-regularized-voxelwise-roughness-estimation" id="toc-theory-regularized-voxelwise-roughness-estimation" class="nav-link" data-scroll-target="#theory-regularized-voxelwise-roughness-estimation"><span class="header-section-number">6.1</span> Theory &amp; Regularized Voxelwise Roughness Estimation</a></li>
+  <li><a href="#monte-carlo-evaluation-of-regional-false-positive-parity-v0.4.0" id="toc-monte-carlo-evaluation-of-regional-false-positive-parity-v0.4.0" class="nav-link" data-scroll-target="#monte-carlo-evaluation-of-regional-false-positive-parity-v0.4.0"><span class="header-section-number">6.2</span> Monte Carlo Evaluation of Regional False-Positive Parity (<code>v0.4.0</code>)</a></li>
   </ul></li>
   <li><a href="#empirical-fwer-threshold-calibration-v0.4.1-grf_sim-vs.-sign_flip" id="toc-empirical-fwer-threshold-calibration-v0.4.1-grf_sim-vs.-sign_flip" class="nav-link" data-scroll-target="#empirical-fwer-threshold-calibration-v0.4.1-grf_sim-vs.-sign_flip"><span class="header-section-number">7</span> Empirical FWER Threshold Calibration (<code>v0.4.1</code>): <code>grf_sim</code> vs. <code>sign_flip</code></a>
   <ul class="collapse">
@@ -2407,7 +2408,7 @@ window.Quarto = {
     <div>
     <div class="quarto-title-meta-heading">Published</div>
     <div class="quarto-title-meta-contents">
-      <p class="date">November 20, 2026</p>
+      <p class="date">November 21, 2026</p>
     </div>
   </div>
   
@@ -2901,6 +2902,44 @@ window.Quarto = {
 </div>
 </div>
 </div>
+</section>
+<section id="monte-carlo-evaluation-of-regional-false-positive-parity-v0.4.0" class="level3" data-number="6.2">
+<h3 data-number="6.2" class="anchored" data-anchor-id="monte-carlo-evaluation-of-regional-false-positive-parity-v0.4.0"><span class="header-section-number">6.2</span> Monte Carlo Evaluation of Regional False-Positive Parity (<code>v0.4.0</code>)</h3>
+<p>In 3D group-fMRI null simulations (<span class="math inline">\(R = 250\)</span> studies, <span class="math inline">\(N = 30\)</span> subjects; <code>42 x 32 x 22</code> search volume spanning subcortex <code>FWHM = 3.0</code>, lateral cortex <code>FWHM = 4.8</code>, and medial DMN <code>FWHM = 7.2</code> voxels; reproducible via <a href="benchmarks/run_simulation_studies.R"><code>docs/benchmarks/run_simulation_studies.R</code></a> and summarized in user vignette <code>vignettes/ptfce-fmri-guide.Rmd</code>), stationary pTFCE exhibits a <strong>17.8<span class="math inline">\(\times\)</span></strong> false-positive disparity across smoothness zones, which <code>nonstationary = TRUE</code> collapses to <strong>1.1<span class="math inline">\(\times\)</span></strong>:</p>
+<table class="caption-top table">
+<colgroup>
+<col style="width: 16%">
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+<col style="width: 20%">
+</colgroup>
+<thead>
+<tr class="header">
+<th style="text-align: left;">Enhancement Mode</th>
+<th style="text-align: center;">Rough Subcortex (<code>FWHM = 3.0</code>) <span class="math inline">\(p &lt; 0.001\)</span> Rate (<span class="math inline">\(\times 10^{-3}\)</span>)</th>
+<th style="text-align: center;">Moderate Cortex (<code>FWHM = 4.8</code>) <span class="math inline">\(p &lt; 0.001\)</span> Rate (<span class="math inline">\(\times 10^{-3}\)</span>)</th>
+<th style="text-align: center;">Smooth Medial DMN (<code>FWHM = 7.2</code>) <span class="math inline">\(p &lt; 0.001\)</span> Rate (<span class="math inline">\(\times 10^{-3}\)</span>)</th>
+<th style="text-align: center;">Smooth / Rough Disparity</th>
+</tr>
+</thead>
+<tbody>
+<tr class="odd">
+<td style="text-align: left;">Stationary pTFCE (<code>nonstationary = FALSE</code>)</td>
+<td style="text-align: center;"><code>0.106</code></td>
+<td style="text-align: center;"><code>0.538</code></td>
+<td style="text-align: center;"><code>1.889</code></td>
+<td style="text-align: center;"><strong>17.8<span class="math inline">\(\times\)</span></strong></td>
+</tr>
+<tr class="even">
+<td style="text-align: left;"><strong>Non-Stationary pTFCE (<code>nonstationary = TRUE</code>)</strong></td>
+<td style="text-align: center;"><strong><code>0.307</code></strong></td>
+<td style="text-align: center;"><strong><code>0.366</code></strong></td>
+<td style="text-align: center;"><strong><code>0.338</code></strong></td>
+<td style="text-align: center;"><strong>1.1<span class="math inline">\(\times\)</span></strong></td>
+</tr>
+</tbody>
+</table>
 <hr>
 </section>
 </section>
@@ -3182,23 +3221,23 @@ window.Quarto = {
 </tr>
 <tr class="even">
 <td style="text-align: left;">4D smoothest(…, nonstationary = TRUE) (301,461 mask voxels x 25 volumes)</td>
-<td style="text-align: right;">0.191</td>
+<td style="text-align: right;">0.188</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">1-sided ptfce() (legacy Nh = 100)</td>
-<td style="text-align: right;">0.104</td>
+<td style="text-align: right;">0.099</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">Bi-sided ptfce() (sided = ‘two.sided’, dh = 0.05, stationary)</td>
-<td style="text-align: right;">0.340</td>
+<td style="text-align: right;">0.325</td>
 </tr>
 <tr class="odd">
 <td style="text-align: left;">Bi-sided ptfce() (sided = ‘two.sided’, dh = 0.05, nonstationary = TRUE, fwe_method = ‘grf’)</td>
-<td style="text-align: right;">0.445</td>
+<td style="text-align: right;">0.427</td>
 </tr>
 <tr class="even">
 <td style="text-align: left;">Bi-sided ptfce() + Rademacher sign_flip FWER calibration (301,461 voxels, B = 200)</td>
-<td style="text-align: right;">3.217</td>
+<td style="text-align: right;">2.969</td>
 </tr>
 </tbody>
 </table>

@@ -2,12 +2,18 @@
 
 High-performance fork of [`spisakt/pTFCE`](https://github.com/spisakt/pTFCE) implementing **Probabilistic Threshold-Free Cluster Enhancement** (Spisák et al., 2019) with a fast C++ (`Rcpp`) engine, exact log-space posterior quadrature, and native bi-sided (two-tailed) fMRI inference.
 
-> **Detailed Technical Report on Fork Modifications:** See [`docs/fork_modifications_report.qmd`](docs/fork_modifications_report.qmd) for mathematical derivations, benchmarks, and a full record of all statistical, numerical, and API departures from upstream `spisakt/pTFCE` (`v0.2.2.1`).
+> **Documentation & Simulation Studies:**
+> - **Practitioner's Guide & Simulation Walkthrough (R Vignette):** [`vignettes/ptfce-fmri-guide.Rmd`](vignettes/ptfce-fmri-guide.Rmd) — accessible conceptual overview, visual examples, Monte Carlo simulation results, and copy-paste recipes for FSL, SPM, and AFNI (`vignette("ptfce-fmri-guide", package = "pTFCE")`).
+> - **Technical Departure Report:** [`docs/fork_modifications_report.qmd`](docs/fork_modifications_report.qmd) — mathematical derivations, C++ architecture, and complete departure log from upstream `spisakt/pTFCE` (`v0.2.2.1`).
+> - **Reproducible Benchmark Suite:** [`docs/benchmarks/run_simulation_studies.R`](docs/benchmarks/run_simulation_studies.R).
 
 ## Installation
 
 ```r
-remotes::install_github("HallquistLab/pTFCE")
+remotes::install_github("HallquistLab/pTFCE", build_vignettes = TRUE)
+
+# Open the user-friendly fMRI guide & simulation study results in R:
+vignette("ptfce-fmri-guide", package = "pTFCE")
 ```
 
 ## Key Enhancements in This Fork (`v0.4.1`)
@@ -33,6 +39,22 @@ remotes::install_github("HallquistLab/pTFCE")
   - `t2z(img, dof)` for exact log-space Student's *t*-to-*Z* conversion without overflow at high `|t|`.
   - `connectivity = c(6, 18, 26)` (matching AFNI `NN = 1, 2, 3`).
   - Vectorized log-space Newton-Raphson `fwe.p2z()` and `fwe.z2p()`.
+
+## Which Settings Should I Use?
+
+| Available fMRI Inputs | Recommended `ptfce()` Call | Why |
+| :--- | :--- | :--- |
+| **4D GLM residuals** (`res4d` + `dof`) | `sided = "two.sided", nonstationary = TRUE, fwe_method = "sign_flip"` | **Recommended default for group fMRI.** Equalizes regional FPR, calibrates exact FWER (`~0.050`) in ~1–7 s whole-brain, and handles heavy-tailed outliers. |
+| **4D subject contrasts** (`copes`, $N \ge 6$) | `copes = copes4d, sided = "two.sided", nonstationary = TRUE` | Auto-estimates 4D smoothness (`dof = N - 1`) and runs exact one-sample Rademacher sign-flipping. |
+| **3D `Z`/`t` map + `RPV.nii`** (no 4D data) | `local_smoothness = "RPV.nii", sided = "two.sided", fwe_method = "grf_sim"` | Non-stationary cluster scaling + exact multi-scale GRF FWER calibration without 4D stacks. |
+| **Single 3D `Z`-map + mask only** | `sided = "two.sided", nonstationary = FALSE, fwe_method = "grf_sim"` | Recovers exact stationary pTFCE FWER power without noisy single-map local smoothness estimates. |
+
+## Empirical Simulation Highlights
+
+In realistic 3D group-fMRI Monte Carlo studies spanning rough subcortex (`FWHM = 3.0` vox), lateral cortex (`FWHM = 4.8` vox), and smooth medial DMN (`FWHM = 7.2` vox; $N = 25$–$30$ subjects, nominal two-sided $\alpha = 0.05$):
+
+- **Regional false-positive parity (`nonstationary = TRUE`):** Stationary pTFCE produces a **17.8$\times$** false-positive disparity between smooth DMN cortex and rough subcortex (`1.89` vs. `0.11` per $10^3$ voxels at $p < 0.001$); `nonstationary = TRUE` collapses this disparity to **1.1$\times$** (`0.34` vs. `0.31` per $10^3$).
+- **Exact FWER & power recovery (`sign_flip` & `grf_sim`):** Analytical raw-field GRF (`fwe_method = "grf"`) yields conservative empirical FWER of `0.010–0.015`. Both `sign_flip` (`FWER = 0.050`) and `grf_sim` (`FWER = 0.045`) restore exact nominal Type I error control, boosting subcortical cluster power from `18.0%` (`NS_GRF`) and `24.0%` (`Raw Z`) to **`32.7%`** (doubling voxel sensitivity from `3.7%` to **`7.4%`**) and tripling lateral cortical power (`8.0%` $\to$ **`24.7%`**) with **`0.0%`** false-positive leakage in null smooth DMN cortex.
 
 ## Quick Start
 
