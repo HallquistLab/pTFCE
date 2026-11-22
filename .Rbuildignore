@@ -11,3 +11,6 @@
 ^_pkgdown\.yml$
 ^_site$
 ^\.github$
+^manuscript$
+^ptfce_technical_note\..*$
+^\.results$

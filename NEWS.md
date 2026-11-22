@@ -1,3 +1,12 @@
+# pTFCE 0.4.2
+
+## Bug Fixes & 2D / Non-Stationary Smoothness Enhancements
+
+* Fixed external 2D/3D `local_smoothness` handling (e.g., SPM `RPV.nii` or `dLh` maps passed without manual `V`/`Rd`/`resels`, as in Vignette Recipe C): `ptfce()` now derives global Riemannian `V`, `Rd`, and `resels` directly from `RPV`/`dLh` maps via `local_smoothness_units = c("auto", "rpv", "dlh", "weights")` instead of falling back to 3D `Z`-map `smoothest()`.
+* Added exact 2D (`D = 2`) Gaussian Random Field cluster-extent and Expected Euler Characteristic formulas across `Es()`, `ptfce_tail_cpp()`, `NullPtfceEngine`, `fwe.z2p()`, and `fwe.p2z()`.
+* Added small-ROI rank-cap and `dof`-mismatch diagnostics in `calibrate_fwer_signflip_cpp()` when `n_act < nt` or supplied `dof` diverges from empirical residual rank.
+* Winsorized extreme supra-threshold excursions (`|Z| > 3`) during single-volume 3D (`nt == 1`) local roughness estimation in `smoothest_cpp()` so strong focal activations do not suppress their own local roughness weights, and made `interpolate(v < 5)` monotone.
+
 # pTFCE 0.4.1
 
 ## Empirical FWER Threshold Calibration

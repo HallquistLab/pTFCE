@@ -4,7 +4,7 @@
 \alias{Es}
 \title{Expected cluster size at threshold h in image of volume V with roughness-volume Rd}
 \usage{
-Es(h, V, Rd)
+Es(h, V, Rd, D = 3L)
 }
 \arguments{
 \item{h}{Z-score cluster-forming threshold(s).}
@@ -12,6 +12,8 @@ Es(h, V, Rd)
 \item{V}{Number of voxels in mask.}
 
 \item{Rd}{Roughness-volume product (\code{dLh * V}).}
+
+\item{D}{Spatial dimension (\code{3} for 3D volumes, default; \code{2} for 2D planar images).}
 }
 \value{
 Expected value of cluster size in voxels.

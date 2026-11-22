@@ -11,21 +11,22 @@ Rcpp::Rostream<false>& Rcpp::Rcerr = Rcpp::Rcpp_cerr_get();
 #endif
 
 // es_cpp
-NumericVector es_cpp(NumericVector h, double V, double Rd);
-RcppExport SEXP _pTFCE_es_cpp(SEXP hSEXP, SEXP VSEXP, SEXP RdSEXP) {
+NumericVector es_cpp(NumericVector h, double V, double Rd, int D);
+RcppExport SEXP _pTFCE_es_cpp(SEXP hSEXP, SEXP VSEXP, SEXP RdSEXP, SEXP DSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
     Rcpp::traits::input_parameter< NumericVector >::type h(hSEXP);
     Rcpp::traits::input_parameter< double >::type V(VSEXP);
     Rcpp::traits::input_parameter< double >::type Rd(RdSEXP);
-    rcpp_result_gen = Rcpp::wrap(es_cpp(h, V, Rd));
+    Rcpp::traits::input_parameter< int >::type D(DSEXP);
+    rcpp_result_gen = Rcpp::wrap(es_cpp(h, V, Rd, D));
     return rcpp_result_gen;
 END_RCPP
 }
 // neglog_pvox_clust_cpp
-NumericVector neglog_pvox_clust_cpp(double V, double Rd, NumericVector c, NumericVector actH, double ZestThr);
-RcppExport SEXP _pTFCE_neglog_pvox_clust_cpp(SEXP VSEXP, SEXP RdSEXP, SEXP cSEXP, SEXP actHSEXP, SEXP ZestThrSEXP) {
+NumericVector neglog_pvox_clust_cpp(double V, double Rd, NumericVector c, NumericVector actH, double ZestThr, int D);
+RcppExport SEXP _pTFCE_neglog_pvox_clust_cpp(SEXP VSEXP, SEXP RdSEXP, SEXP cSEXP, SEXP actHSEXP, SEXP ZestThrSEXP, SEXP DSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -34,13 +35,14 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< NumericVector >::type c(cSEXP);
     Rcpp::traits::input_parameter< NumericVector >::type actH(actHSEXP);
     Rcpp::traits::input_parameter< double >::type ZestThr(ZestThrSEXP);
-    rcpp_result_gen = Rcpp::wrap(neglog_pvox_clust_cpp(V, Rd, c, actH, ZestThr));
+    Rcpp::traits::input_parameter< int >::type D(DSEXP);
+    rcpp_result_gen = Rcpp::wrap(neglog_pvox_clust_cpp(V, Rd, c, actH, ZestThr, D));
     return rcpp_result_gen;
 END_RCPP
 }
 // dvox_clust_cpp
-NumericVector dvox_clust_cpp(NumericVector h, double V, double Rd, double c, double ZestThr);
-RcppExport SEXP _pTFCE_dvox_clust_cpp(SEXP hSEXP, SEXP VSEXP, SEXP RdSEXP, SEXP cSEXP, SEXP ZestThrSEXP) {
+NumericVector dvox_clust_cpp(NumericVector h, double V, double Rd, double c, double ZestThr, int D);
+RcppExport SEXP _pTFCE_dvox_clust_cpp(SEXP hSEXP, SEXP VSEXP, SEXP RdSEXP, SEXP cSEXP, SEXP ZestThrSEXP, SEXP DSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -49,7 +51,8 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< double >::type Rd(RdSEXP);
     Rcpp::traits::input_parameter< double >::type c(cSEXP);
     Rcpp::traits::input_parameter< double >::type ZestThr(ZestThrSEXP);
-    rcpp_result_gen = Rcpp::wrap(dvox_clust_cpp(h, V, Rd, c, ZestThr));
+    Rcpp::traits::input_parameter< int >::type D(DSEXP);
+    rcpp_result_gen = Rcpp::wrap(dvox_clust_cpp(h, V, Rd, c, ZestThr, D));
     return rcpp_result_gen;
 END_RCPP
 }
@@ -124,8 +127,8 @@ BEGIN_RCPP
 END_RCPP
 }
 // calibrate_fwer_signflip_cpp
-List calibrate_fwer_signflip_cpp(NumericVector data4d, LogicalVector mask, int nx, int ny, int nz, int nt, bool center_residuals, double V, double Rd, double ZestThr, int connectivity, int sided_mode, bool use_legacy, int Nh_eff, double logpmin, double logpmax_fixed, double dh, int n_perm, Nullable<NumericVector> voxel_weights);
-RcppExport SEXP _pTFCE_calibrate_fwer_signflip_cpp(SEXP data4dSEXP, SEXP maskSEXP, SEXP nxSEXP, SEXP nySEXP, SEXP nzSEXP, SEXP ntSEXP, SEXP center_residualsSEXP, SEXP VSEXP, SEXP RdSEXP, SEXP ZestThrSEXP, SEXP connectivitySEXP, SEXP sided_modeSEXP, SEXP use_legacySEXP, SEXP Nh_effSEXP, SEXP logpminSEXP, SEXP logpmax_fixedSEXP, SEXP dhSEXP, SEXP n_permSEXP, SEXP voxel_weightsSEXP) {
+List calibrate_fwer_signflip_cpp(NumericVector data4d, LogicalVector mask, int nx, int ny, int nz, int nt, bool center_residuals, double V, double Rd, double ZestThr, int connectivity, int sided_mode, bool use_legacy, int Nh_eff, double logpmin, double logpmax_fixed, double dh, int n_perm, Nullable<NumericVector> voxel_weights, double dof_hint);
+RcppExport SEXP _pTFCE_calibrate_fwer_signflip_cpp(SEXP data4dSEXP, SEXP maskSEXP, SEXP nxSEXP, SEXP nySEXP, SEXP nzSEXP, SEXP ntSEXP, SEXP center_residualsSEXP, SEXP VSEXP, SEXP RdSEXP, SEXP ZestThrSEXP, SEXP connectivitySEXP, SEXP sided_modeSEXP, SEXP use_legacySEXP, SEXP Nh_effSEXP, SEXP logpminSEXP, SEXP logpmax_fixedSEXP, SEXP dhSEXP, SEXP n_permSEXP, SEXP voxel_weightsSEXP, SEXP dof_hintSEXP) {
 BEGIN_RCPP
     Rcpp::RObject rcpp_result_gen;
     Rcpp::RNGScope rcpp_rngScope_gen;
@@ -148,19 +151,20 @@ BEGIN_RCPP
     Rcpp::traits::input_parameter< double >::type dh(dhSEXP);
     Rcpp::traits::input_parameter< int >::type n_perm(n_permSEXP);
     Rcpp::traits::input_parameter< Nullable<NumericVector> >::type voxel_weights(voxel_weightsSEXP);
-    rcpp_result_gen = Rcpp::wrap(calibrate_fwer_signflip_cpp(data4d, mask, nx, ny, nz, nt, center_residuals, V, Rd, ZestThr, connectivity, sided_mode, use_legacy, Nh_eff, logpmin, logpmax_fixed, dh, n_perm, voxel_weights));
+    Rcpp::traits::input_parameter< double >::type dof_hint(dof_hintSEXP);
+    rcpp_result_gen = Rcpp::wrap(calibrate_fwer_signflip_cpp(data4d, mask, nx, ny, nz, nt, center_residuals, V, Rd, ZestThr, connectivity, sided_mode, use_legacy, Nh_eff, logpmin, logpmax_fixed, dh, n_perm, voxel_weights, dof_hint));
     return rcpp_result_gen;
 END_RCPP
 }
 
 static const R_CallMethodDef CallEntries[] = {
-    {"_pTFCE_es_cpp", (DL_FUNC) &_pTFCE_es_cpp, 3},
-    {"_pTFCE_neglog_pvox_clust_cpp", (DL_FUNC) &_pTFCE_neglog_pvox_clust_cpp, 5},
-    {"_pTFCE_dvox_clust_cpp", (DL_FUNC) &_pTFCE_dvox_clust_cpp, 5},
+    {"_pTFCE_es_cpp", (DL_FUNC) &_pTFCE_es_cpp, 4},
+    {"_pTFCE_neglog_pvox_clust_cpp", (DL_FUNC) &_pTFCE_neglog_pvox_clust_cpp, 6},
+    {"_pTFCE_dvox_clust_cpp", (DL_FUNC) &_pTFCE_dvox_clust_cpp, 6},
     {"_pTFCE_ptfce_tail_cpp", (DL_FUNC) &_pTFCE_ptfce_tail_cpp, 14},
     {"_pTFCE_smoothest_cpp", (DL_FUNC) &_pTFCE_smoothest_cpp, 9},
     {"_pTFCE_calibrate_fwer_grf_cpp", (DL_FUNC) &_pTFCE_calibrate_fwer_grf_cpp, 17},
-    {"_pTFCE_calibrate_fwer_signflip_cpp", (DL_FUNC) &_pTFCE_calibrate_fwer_signflip_cpp, 19},
+    {"_pTFCE_calibrate_fwer_signflip_cpp", (DL_FUNC) &_pTFCE_calibrate_fwer_signflip_cpp, 20},
     {NULL, NULL, 0}
 };
 

@@ -27,8 +27,15 @@ inline double log_mills_norm(double h) {
   return -HALF_LOG_2PI - std::log(h + cf);
 }
 
-// Log of expected cluster size Es(h, V, Rd) from GRF theory
-inline double log_es_scalar(double h, double logV, double logRd) {
+// Log of expected cluster size Es(h, V, Rd) from D-dimensional GRF theory (D in {2, 3})
+inline double log_es_scalar(double h, double logV, double logRd, int D = 3) {
+  if (D == 2) {
+    if (h >= 0.5) {
+      // 2D Euler density: Rd * (2*pi)^(-3/2) * h * exp(-0.5*h^2)
+      return logV - logRd + 1.5 * LOG_2PI - std::log(h) + log_mills_norm(h);
+    }
+    return logV + R::pnorm5(h, 0.0, 1.0, 0, 1);
+  }
   if (h >= 1.1) {
     double h2 = h * h;
     // log(V) + log(Phi(-h)) - (log(Rd) + log(h^2 - 1) - 0.5*h^2 - 2*log(2*pi))
@@ -39,14 +46,15 @@ inline double log_es_scalar(double h, double logV, double logRd) {
 }
 
 // Log of unnormalized posterior density:
-// l(h) = log(phi(h)) + log(lambda(h)) - c^(2/3) * lambda(h)
-// Strictly concave on (1.1, Inf).
-inline double log_post_unnorm(double h, double logV, double logRd, double c23) {
-  double log_es = log_es_scalar(h, logV, logRd);
-  double log_lam = (-2.0 / 3.0) * (log_es - LGAMMA_2_5);
-  double lam_c23 = std::exp(log_lam) * c23;
+// l_D(h) = log(phi(h)) + log(lambda_D(h)) - c^(2/D) * lambda_D(h),
+// where c_pow = c^(2/D) (c^1 for D=2, c^(2/3) for D=3).
+// Strictly concave on (0.5, Inf) for D=2 and on (h_0, Inf) (h_0 ~ 1.2610) for D=3.
+inline double log_post_unnorm(double h, double logV, double logRd, double c_pow, int D = 3) {
+  double log_es = log_es_scalar(h, logV, logRd, D);
+  double log_lam = (D == 2) ? (-log_es) : ((-2.0 / 3.0) * (log_es - LGAMMA_2_5));
+  double lam_cpow = std::exp(log_lam) * c_pow;
   double log_phi = -HALF_LOG_2PI - 0.5 * h * h;
-  return log_phi + log_lam - lam_c23;
+  return log_phi + log_lam - lam_cpow;
 }
 
 // 15-point Gauss-Kronrod rule on [a, b] for exp(log_post_unnorm(x) - shift)
@@ -56,7 +64,7 @@ struct GKResult {
 };
 
 inline GKResult gk15_panel(double a, double b, double shift,
-                           double logV, double logRd, double c23) {
+                           double logV, double logRd, double c_pow, int D = 3) {
   // Positive abscissae and weights for G7 / K15 on [-1, 1]
   static const double xgk[8] = {
     0.991455371120812639206854697526329,
@@ -87,14 +95,14 @@ inline GKResult gk15_panel(double a, double b, double shift,
 
   double center = 0.5 * (a + b);
   double half = 0.5 * (b - a);
-  double f_center = std::exp(log_post_unnorm(center, logV, logRd, c23) - shift);
+  double f_center = std::exp(log_post_unnorm(center, logV, logRd, c_pow, D) - shift);
   double res_g = wg[3] * f_center;
   double res_k = wgk[7] * f_center;
 
   for (int j = 0; j < 7; ++j) {
     double absc = half * xgk[j];
-    double fval1 = std::exp(log_post_unnorm(center - absc, logV, logRd, c23) - shift);
-    double fval2 = std::exp(log_post_unnorm(center + absc, logV, logRd, c23) - shift);
+    double fval1 = std::exp(log_post_unnorm(center - absc, logV, logRd, c_pow, D) - shift);
+    double fval2 = std::exp(log_post_unnorm(center + absc, logV, logRd, c_pow, D) - shift);
     double fsum = fval1 + fval2;
     res_k += wgk[j] * fsum;
     if (j % 2 == 1) {
@@ -107,37 +115,38 @@ inline GKResult gk15_panel(double a, double b, double shift,
 }
 
 double adaptive_gk15(double a, double b, double shift,
-                     double logV, double logRd, double c23,
-                     double tol, int depth = 0) {
+                     double logV, double logRd, double c_pow,
+                     double tol, int D = 3, int depth = 0) {
   if (b <= a) return 0.0;
-  GKResult r = gk15_panel(a, b, shift, logV, logRd, c23);
+  GKResult r = gk15_panel(a, b, shift, logV, logRd, c_pow, D);
   if (r.err <= tol * std::max(1e-16, r.val) || depth >= 18) {
     return r.val;
   }
   double mid = 0.5 * (a + b);
-  return adaptive_gk15(a, mid, shift, logV, logRd, c23, tol, depth + 1) +
-         adaptive_gk15(mid, b, shift, logV, logRd, c23, tol, depth + 1);
+  return adaptive_gk15(a, mid, shift, logV, logRd, c_pow, tol, D, depth + 1) +
+         adaptive_gk15(mid, b, shift, logV, logRd, c_pow, tol, D, depth + 1);
 }
 
 // Find unique global mode of log_post_unnorm on [a, b_max] (b_max <= Inf)
-inline double find_mode_on(double a, double b_max, double logV, double logRd, double c23, double &max_val) {
-  double fa = log_post_unnorm(a, logV, logRd, c23);
+inline double find_mode_on(double a, double b_max, double logV, double logRd, double c_pow,
+                           double &max_val, int D = 3) {
+  double fa = log_post_unnorm(a, logV, logRd, c_pow, D);
   double eps = std::min(1e-5, 0.25 * (b_max - a));
   if (eps <= 0.0) {
     max_val = fa;
     return a;
   }
-  double fa_eps = log_post_unnorm(a + eps, logV, logRd, c23);
+  double fa_eps = log_post_unnorm(a + eps, logV, logRd, c_pow, D);
   if (fa_eps <= fa) {
-    // By strict concavity on (1.1, Inf), mode on [a, b_max] is at x = a
+    // By strict concavity on support, mode on [a, b_max] is at x = a
     max_val = fa;
     return a;
   }
   // Bracket peak
   double lo = a;
   double hi = std::min(b_max, a + 0.5);
-  while (hi < b_max && log_post_unnorm(hi, logV, logRd, c23) >
-                       log_post_unnorm(std::max(a, hi - 1e-4), logV, logRd, c23)) {
+  while (hi < b_max && log_post_unnorm(hi, logV, logRd, c_pow, D) >
+                       log_post_unnorm(std::max(a, hi - 1e-4), logV, logRd, c_pow, D)) {
     lo = hi;
     double step = std::max(0.5, hi - a);
     hi = std::min(b_max, hi + step);
@@ -149,26 +158,26 @@ inline double find_mode_on(double a, double b_max, double logV, double logRd, do
   const double invphi2 = 0.3819660112501051518;
   double x1 = lo + invphi2 * (hi - lo);
   double x2 = lo + invphi * (hi - lo);
-  double f1 = log_post_unnorm(x1, logV, logRd, c23);
-  double f2 = log_post_unnorm(x2, logV, logRd, c23);
+  double f1 = log_post_unnorm(x1, logV, logRd, c_pow, D);
+  double f2 = log_post_unnorm(x2, logV, logRd, c_pow, D);
   for (int it = 0; it < 48; ++it) {
     if (f1 < f2) {
       lo = x1;
       x1 = x2;
       f1 = f2;
       x2 = lo + invphi * (hi - lo);
-      f2 = log_post_unnorm(x2, logV, logRd, c23);
+      f2 = log_post_unnorm(x2, logV, logRd, c_pow, D);
     } else {
       hi = x2;
       x2 = x1;
       f2 = f1;
       x1 = lo + invphi2 * (hi - lo);
-      f1 = log_post_unnorm(x1, logV, logRd, c23);
+      f1 = log_post_unnorm(x1, logV, logRd, c_pow, D);
     }
   }
   double mode = 0.5 * (lo + hi);
-  max_val = log_post_unnorm(mode, logV, logRd, c23);
-  double fb = (std::isfinite(b_max)) ? log_post_unnorm(b_max, logV, logRd, c23) : -INFINITY;
+  max_val = log_post_unnorm(mode, logV, logRd, c_pow, D);
+  double fb = (std::isfinite(b_max)) ? log_post_unnorm(b_max, logV, logRd, c_pow, D) : -INFINITY;
   if (fb > max_val) {
     max_val = fb;
     return b_max;
@@ -177,21 +186,21 @@ inline double find_mode_on(double a, double b_max, double logV, double logRd, do
 }
 
 // Compute log( int_a^Inf exp(log_post_unnorm(x)) dx )
-double log_integral_tail(double a, double logV, double logRd, double c23) {
+double log_integral_tail(double a, double logV, double logRd, double c_pow, int D = 3) {
   double max_f = 0.0;
-  double mode = find_mode_on(a, INFINITY, logV, logRd, c23, max_f);
+  double mode = find_mode_on(a, INFINITY, logV, logRd, c_pow, max_f, D);
 
   // Bracket upper cutoff b > mode where log_post_unnorm(b) <= max_f - 50
   const double drop = 50.0; // exp(-50) ~ 1.9e-22
   double step = 0.25;
-  while (log_post_unnorm(mode + step, logV, logRd, c23) > max_f - drop) {
+  while (log_post_unnorm(mode + step, logV, logRd, c_pow, D) > max_f - drop) {
     step *= 2.0;
   }
   double lo = mode + ((step > 0.25) ? 0.5 * step : 0.0);
   double hi = mode + step;
   for (int it = 0; it < 28; ++it) {
     double mid = 0.5 * (lo + hi);
-    if (log_post_unnorm(mid, logV, logRd, c23) > max_f - drop) {
+    if (log_post_unnorm(mid, logV, logRd, c_pow, D) > max_f - drop) {
       lo = mid;
     } else {
       hi = mid;
@@ -199,34 +208,34 @@ double log_integral_tail(double a, double logV, double logRd, double c23) {
   }
   double b = hi;
 
-  double int_left = (mode > a) ? adaptive_gk15(a, mode, max_f, logV, logRd, c23, 1e-12) : 0.0;
-  double int_right = adaptive_gk15(mode, b, max_f, logV, logRd, c23, 1e-12);
+  double int_left = (mode > a) ? adaptive_gk15(a, mode, max_f, logV, logRd, c_pow, 1e-12, D) : 0.0;
+  double int_right = adaptive_gk15(mode, b, max_f, logV, logRd, c_pow, 1e-12, D);
   return max_f + std::log(int_left + int_right);
 }
 
 // Compute log( int_a^b exp(log_post_unnorm(x)) dx ) for finite [a, b]
-double log_integral_interval(double a, double b, double logV, double logRd, double c23) {
+double log_integral_interval(double a, double b, double logV, double logRd, double c_pow, int D = 3) {
   if (b <= a) return -INFINITY;
   double max_f = 0.0;
-  double mode = find_mode_on(a, b, logV, logRd, c23, max_f);
-  double int_l = (mode > a) ? adaptive_gk15(a, mode, max_f, logV, logRd, c23, 1e-12) : 0.0;
-  double int_r = (b > mode) ? adaptive_gk15(mode, b, max_f, logV, logRd, c23, 1e-12) : 0.0;
+  double mode = find_mode_on(a, b, logV, logRd, c_pow, max_f, D);
+  double int_l = (mode > a) ? adaptive_gk15(a, mode, max_f, logV, logRd, c_pow, 1e-12, D) : 0.0;
+  double int_r = (b > mode) ? adaptive_gk15(mode, b, max_f, logV, logRd, c_pow, 1e-12, D) : 0.0;
   return max_f + std::log(int_l + int_r);
 }
 
 // Exact -log(P(H > actH | C = c)) using optional cached log_den
 inline double neglog_pvox_clust_cached(double actH, double ZestThr,
-                                       double logV, double logRd, double c23,
-                                       double log_den) {
+                                       double logV, double logRd, double c_pow,
+                                       double log_den, int D = 3) {
   if (actH <= ZestThr) {
     return -R::pnorm5(actH, 0.0, 1.0, 0, 1);
   }
-  double log_num = log_integral_tail(actH, logV, logRd, c23);
+  double log_num = log_integral_tail(actH, logV, logRd, c_pow, D);
   double diff = log_den - log_num;
   if (diff < 0.05) {
     // Near ZestThr where P ~ 1: integrate [ZestThr, actH] directly so
     // -log(P) = log(1 + I_left / I_num) > 0 with zero cancellation!
-    double log_left = log_integral_interval(ZestThr, actH, logV, logRd, c23);
+    double log_left = log_integral_interval(ZestThr, actH, logV, logRd, c_pow, D);
     double ratio_log = log_left - log_num;
     if (ratio_log > 35.0) {
       return ratio_log;
@@ -338,7 +347,8 @@ void smooth_3d_separable(std::vector<double> &vol, int nx, int ny, int nz, doubl
 } // namespace
 
 // [[Rcpp::export]]
-NumericVector es_cpp(NumericVector h, double V, double Rd) {
+NumericVector es_cpp(NumericVector h, double V, double Rd, int D = 3) {
+  int dim_eff = (D == 2) ? 2 : 3;
   int n = h.size();
   NumericVector out(n);
   double logV = std::log(V);
@@ -347,7 +357,7 @@ NumericVector es_cpp(NumericVector h, double V, double Rd) {
     if (NumericVector::is_na(h[i])) {
       out[i] = NA_REAL;
     } else {
-      out[i] = std::exp(log_es_scalar(h[i], logV, logRd));
+      out[i] = std::exp(log_es_scalar(h[i], logV, logRd, dim_eff));
     }
   }
   return out;
@@ -355,7 +365,9 @@ NumericVector es_cpp(NumericVector h, double V, double Rd) {
 
 // [[Rcpp::export]]
 NumericVector neglog_pvox_clust_cpp(double V, double Rd, NumericVector c,
-                                    NumericVector actH, double ZestThr = 1.3) {
+                                    NumericVector actH, double ZestThr = 1.3,
+                                    int D = 3) {
+  int dim_eff = (D == 2) ? 2 : 3;
   int nc = c.size();
   int nh = actH.size();
   int n = std::max(nc, nh);
@@ -377,23 +389,24 @@ NumericVector neglog_pvox_clust_cpp(double V, double Rd, NumericVector c,
       out[i] = -R::pnorm5(hi, 0.0, 1.0, 0, 1);
       continue;
     }
-    double c23 = std::pow(ci, 2.0 / 3.0);
+    double c_pow = (dim_eff == 2) ? ci : std::pow(ci, 2.0 / 3.0);
     double lden;
     auto it = den_cache.find(ci);
     if (it == den_cache.end()) {
-      lden = log_integral_tail(ZestThr, logV, logRd, c23);
+      lden = log_integral_tail(ZestThr, logV, logRd, c_pow, dim_eff);
       den_cache[ci] = lden;
     } else {
       lden = it->second;
     }
-    out[i] = neglog_pvox_clust_cached(hi, ZestThr, logV, logRd, c23, lden);
+    out[i] = neglog_pvox_clust_cached(hi, ZestThr, logV, logRd, c_pow, lden, dim_eff);
   }
   return out;
 }
 
 // [[Rcpp::export]]
 NumericVector dvox_clust_cpp(NumericVector h, double V, double Rd, double c,
-                             double ZestThr = 1.3) {
+                             double ZestThr = 1.3, int D = 3) {
+  int dim_eff = (D == 2) ? 2 : 3;
   int n = h.size();
   NumericVector out(n);
   if (NumericVector::is_na(c) || c <= 0.0) {
@@ -404,15 +417,15 @@ NumericVector dvox_clust_cpp(NumericVector h, double V, double Rd, double c,
   }
   double logV = std::log(V);
   double logRd = std::log(Rd);
-  double c23 = std::pow(c, 2.0 / 3.0);
-  double log_den = log_integral_tail(ZestThr, logV, logRd, c23);
+  double c_pow = (dim_eff == 2) ? c : std::pow(c, 2.0 / 3.0);
+  double log_den = log_integral_tail(ZestThr, logV, logRd, c_pow, dim_eff);
   for (int i = 0; i < n; ++i) {
     if (NumericVector::is_na(h[i])) {
       out[i] = NA_REAL;
     } else if (h[i] < ZestThr) {
       out[i] = 0.0;
     } else {
-      out[i] = std::exp(log_post_unnorm(h[i], logV, logRd, c23) - log_den);
+      out[i] = std::exp(log_post_unnorm(h[i], logV, logRd, c_pow, dim_eff) - log_den);
     }
   }
   return out;
@@ -430,6 +443,8 @@ NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask,
                              Nullable<NumericVector> voxel_weights = R_NilValue) {
   int n = nx * ny * nz;
   int nth = threshs.size();
+  const int dim_eff = (nz > 1) ? 3 : 2;
+  const double beta_d = (dim_eff == 2) ? 1.0 : (2.0 / 3.0);
   double logV = std::log(V);
   double logRd = std::log(Rd);
   double x_zest = -R::pnorm5(ZestThr, 0.0, 1.0, 0, 1);
@@ -439,9 +454,10 @@ NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask,
     vw = NumericVector(voxel_weights);
   }
 
-  // Build neighbor offsets for 6, 18, or 26 connectivity
+  // Build neighbor offsets for 6, 18, or 26 connectivity (4 or 8 in 2D when nz == 1)
   std::vector<int> dx, dy, dz;
-  for (int oz = -1; oz <= 1; ++oz) {
+  int oz_lim = (nz > 1) ? 1 : 0;
+  for (int oz = -oz_lim; oz <= oz_lim; ++oz) {
     for (int oy = -1; oy <= 1; ++oy) {
       for (int ox = -1; ox <= 1; ++ox) {
         int manhattan = std::abs(ox) + std::abs(oy) + std::abs(oz);
@@ -574,16 +590,16 @@ NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask,
           if (r == idx) {
             int c = comp_sz[r];
             if (step_val_cache.find(c) == step_val_cache.end()) {
-              double c23 = std::pow(static_cast<double>(c), 2.0 / 3.0);
+              double c_pow = (dim_eff == 2) ? static_cast<double>(c) : std::pow(static_cast<double>(c), 2.0 / 3.0);
               double lden;
               auto it = log_den_cache.find(c);
               if (it == log_den_cache.end()) {
-                lden = log_integral_tail(ZestThr, logV, logRd, c23);
+                lden = log_integral_tail(ZestThr, logV, logRd, c_pow, dim_eff);
                 log_den_cache[c] = lden;
               } else {
                 lden = it->second;
               }
-              double nlp = neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c23, lden);
+              double nlp = neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c_pow, lden, dim_eff);
               step_val_cache[c] = w * nlp;
             }
           }
@@ -621,8 +637,8 @@ NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask,
       if (n_ord > 0) {
         for (int g = 0; g < N_DEN_GRID; ++g) {
           double s = s_min + g * ds_den;
-          double c23 = std::exp((2.0 / 3.0) * s);
-          den_grid[g] = log_integral_tail(ZestThr, logV, logRd, c23);
+          double c_pow = std::exp(beta_d * s);
+          den_grid[g] = log_integral_tail(ZestThr, logV, logRd, c_pow, dim_eff);
         }
       }
 
@@ -687,9 +703,9 @@ NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask,
           for (int r : roots) {
             double cm = comp_mass[r];
             double log_cm = std::log(cm);
-            double c23 = std::exp((2.0 / 3.0) * log_cm);
+            double c_pow = std::exp(beta_d * log_cm);
             double lden = interp_cubic_equispaced(den_grid, s_min, inv_ds_den, log_cm);
-            double nlp = neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c23, lden);
+            double nlp = neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c_pow, lden, dim_eff);
             root_step_val[r] = w * nlp;
           }
         } else {
@@ -700,9 +716,9 @@ NumericVector ptfce_tail_cpp(NumericVector img, LogicalVector mask,
           double inv_ds_step = 1.0 / ds_step;
           for (int g = 0; g < N_STEP_GRID; ++g) {
             double s = ls_lo + g * ds_step;
-            double c23 = std::exp((2.0 / 3.0) * s);
+            double c_pow = std::exp(beta_d * s);
             double lden = interp_cubic_equispaced(den_grid, s_min, inv_ds_den, s);
-            step_grid[g] = w * neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c23, lden);
+            step_grid[g] = w * neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c_pow, lden, dim_eff);
           }
           for (int r : roots) {
             double log_cm = std::log(comp_mass[r]);
@@ -962,22 +978,40 @@ List smoothest_cpp(NumericVector img, NumericVector mask,
     }
 
     if (compute_local) {
+      // For a single 3D Z-map (nt == 1), estimate global noise variance robustly via
+      // median(Z^2) / qchisq(0.5, 1) and form local lag-1 covariances from 0.5*(Z_u - Z_v)^2
+      // so non-zero mean signal clusters (Z = mu + eps) do not inflate S2 by mu^2 and
+      // artificially crush their own local roughness weights.
+      std::vector<double> z2_in;
+      z2_in.reserve(mask_volume);
+      for (int i = 0; i < n_vox; ++i) {
+        if (active[i]) z2_in.push_back(img[i] * img[i]);
+      }
+      double sigma2_rob = 1.0;
+      if (!z2_in.empty()) {
+        size_t mid_idx = z2_in.size() / 2;
+        std::nth_element(z2_in.begin(), z2_in.begin() + mid_idx, z2_in.end());
+        double med_z2 = z2_in[mid_idx];
+        if (med_z2 > 1e-12) {
+          sigma2_rob = med_z2 / 0.4549364231195728; // qchisq(0.5, df = 1)
+        }
+      }
       for (int idx : edges_x) {
-        double v0 = img[idx], v1 = img[idx - 1];
-        double p = v0 * v1, s = 0.5 * (v0 * v0 + v1 * v1);
+        double d = img[idx] - img[idx - 1];
+        double p = sigma2_rob - 0.5 * d * d, s = sigma2_rob;
         vox_ss_x[idx] += p; vox_ss_x[idx - 1] += p;
         vox_s2_x[idx] += s; vox_s2_x[idx - 1] += s;
       }
       for (int idx : edges_y) {
-        double v0 = img[idx], v1 = img[idx - nx];
-        double p = v0 * v1, s = 0.5 * (v0 * v0 + v1 * v1);
+        double d = img[idx] - img[idx - nx];
+        double p = sigma2_rob - 0.5 * d * d, s = sigma2_rob;
         vox_ss_y[idx] += p; vox_ss_y[idx - nx] += p;
         vox_s2_y[idx] += s; vox_s2_y[idx - nx] += s;
       }
       if (usez) {
         for (int idx : edges_z) {
-          double v0 = img[idx], v1 = img[idx - nxy];
-          double p = v0 * v1, s = 0.5 * (v0 * v0 + v1 * v1);
+          double d = img[idx] - img[idx - nxy];
+          double p = sigma2_rob - 0.5 * d * d, s = sigma2_rob;
           vox_ss_z[idx] += p; vox_ss_z[idx - nxy] += p;
           vox_s2_z[idx] += s; vox_s2_z[idx - nxy] += s;
         }
@@ -1238,7 +1272,8 @@ void convolve_padded_bbox_3d(const std::vector<double> &w_pad,
 // across hundreds of null replicates without numerical quadrature or heap churn inside the loop.
 class NullPtfceEngine {
 public:
-  int nx, ny, nz, n, nxy;
+  int nx, ny, nz, n, nxy, dim_eff;
+  double beta_d;
   double V, Rd, logV, logRd, ZestThr, x_zest, base_acc_zest;
   int connectivity;
   int sided_mode; // 0 = positive, 1 = negative, 2 = two.sided
@@ -1283,6 +1318,8 @@ public:
                   double logpmin_, double logpmax_fixed_, double dh_,
                   Nullable<NumericVector> voxel_weights_)
       : nx(nx_), ny(ny_), nz(nz_), n(nx_ * ny_ * nz_), nxy(nx_ * ny_),
+        dim_eff((nz_ > 1) ? 3 : 2),
+        beta_d((nz_ > 1) ? (2.0 / 3.0) : 1.0),
         V(V_), Rd(Rd_), logV(std::log(V_)), logRd(std::log(Rd_)),
         ZestThr(ZestThr_),
         x_zest(-R::pnorm5(ZestThr_, 0.0, 1.0, 0, 1)),
@@ -1323,7 +1360,8 @@ public:
     root_step.assign(n, 0.0);
     order.reserve(mask_idx.size() / 4 + 32);
 
-    for (int oz = -1; oz <= 1; ++oz) {
+    int oz_lim = (nz > 1) ? 1 : 0;
+    for (int oz = -oz_lim; oz <= oz_lim; ++oz) {
       for (int oy = -1; oy <= 1; ++oy) {
         for (int ox = -1; ox <= 1; ++ox) {
           int manhattan = std::abs(ox) + std::abs(oy) + std::abs(oz);
@@ -1343,15 +1381,15 @@ public:
       if (!use_nonstat) {
         small_den.assign(SMALL_C_MAX + 1, 0.0);
         for (int c = 1; c <= SMALL_C_MAX; ++c) {
-          double c23 = std::pow(static_cast<double>(c), 2.0 / 3.0);
-          small_den[c] = log_integral_tail(ZestThr, logV, logRd, c23);
+          double c_pow = (dim_eff == 2) ? static_cast<double>(c) : std::pow(static_cast<double>(c), 2.0 / 3.0);
+          small_den[c] = log_integral_tail(ZestThr, logV, logRd, c_pow, dim_eff);
         }
       }
       lut_den.assign(N_C_LUT, 0.0);
       for (int g = 0; g < N_C_LUT; ++g) {
         double s = s_min + g * ds_lut;
-        double c23 = std::exp((2.0 / 3.0) * s);
-        lut_den[g] = log_integral_tail(ZestThr, logV, logRd, c23);
+        double c_pow = std::exp(beta_d * s);
+        lut_den[g] = log_integral_tail(ZestThr, logV, logRd, c_pow, dim_eff);
       }
       top_x_grid = x_zest;
       extend_modern_grid_to(30.0); // initially cover up to -log(p) = 30 (Z ~ 7.4)
@@ -1418,15 +1456,15 @@ public:
     if (!use_nonstat) {
       double *s_row = &small_step_lut[static_cast<size_t>(hi) * (SMALL_C_MAX + 1)];
       for (int c = 1; c <= SMALL_C_MAX; ++c) {
-        double c23 = std::pow(static_cast<double>(c), 2.0 / 3.0);
-        s_row[c] = w * neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c23, small_den[c]);
+        double c_pow = (dim_eff == 2) ? static_cast<double>(c) : std::pow(static_cast<double>(c), 2.0 / 3.0);
+        s_row[c] = w * neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c_pow, small_den[c], dim_eff);
       }
     }
     double *c_row = &cubic_step_lut[static_cast<size_t>(hi) * N_C_LUT];
     for (int g = 0; g < N_C_LUT; ++g) {
       double s = s_min + g * ds_lut;
-      double c23 = std::exp((2.0 / 3.0) * s);
-      c_row[g] = w * neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c23, lut_den[g]);
+      double c_pow = std::exp(beta_d * s);
+      c_row[g] = w * neglog_pvox_clust_cached(h, ZestThr, logV, logRd, c_pow, lut_den[g], dim_eff);
     }
     row_ready[hi] = 1;
   }
@@ -1978,7 +2016,8 @@ List calibrate_fwer_signflip_cpp(NumericVector data4d,
                                  bool use_legacy, int Nh_eff,
                                  double logpmin, double logpmax_fixed,
                                  double dh, int n_perm,
-                                 Nullable<NumericVector> voxel_weights = R_NilValue) {
+                                 Nullable<NumericVector> voxel_weights = R_NilValue,
+                                 double dof_hint = NA_REAL) {
   RNGScope rng_scope;
 
   NullPtfceEngine engine(mask, nx, ny, nz, V, Rd, ZestThr,
@@ -2094,6 +2133,20 @@ List calibrate_fwer_signflip_cpp(NumericVector data4d,
           nu_sub++;
         }
       }
+    }
+    if (n_act < nt && nu_sub < nt - 1) {
+      Rcpp::warning(
+        "Active mask voxel count (%d) is smaller than 4D residual volume count (%d); "
+        "empirical residual-subspace rank is capped at %d. Consider supplying 4D `copes` "
+        "or `fwe_method = \"grf_sim\"` for very small ROIs.",
+        n_act, nt, nu_sub
+      );
+    } else if (R_FINITE(dof_hint) && dof_hint > 0.0 && std::fabs(static_cast<double>(nu_sub) - dof_hint) > 2.5) {
+      Rcpp::warning(
+        "Empirical residual-subspace rank (%d) differs from supplied `dof` (%.1f); "
+        "using empirical residual rank for sign-flip studentization.",
+        nu_sub, dof_hint
+      );
     }
   }
 

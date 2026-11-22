@@ -4,17 +4,19 @@
 \alias{fwe.z2p}
 \title{Convert Z-score value(s) to GRF FWER-corrected p-value(s)}
 \usage{
-fwe.z2p(resel_count, Z)
+fwe.z2p(resel_count, Z, D = 3L)
 }
 \arguments{
 \item{resel_count}{Number of resels in the search volume (\code{volume / resels}).}
 
 \item{Z}{Numeric vector of Z-score values.}
+
+\item{D}{Spatial dimension (\code{3} for 3D volumes, default; \code{2} for 2D planar images).}
 }
 \value{
 Numeric vector of FWER-corrected p-values in \code{[0, 1]}.
 }
 \description{
-Uses the 3D Gaussian Random Field Expected Euler Characteristic approximation.
+Uses the 2D or 3D Gaussian Random Field Expected Euler Characteristic approximation.
 Vectorized over \code{Z} and \code{resel_count}.
 }

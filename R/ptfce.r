@@ -55,9 +55,17 @@ NULL
 #'   Salimi-Khorshidi et al., 2011). Default is \code{FALSE} (stationary cluster voxel counts).
 #' @param local_smoothness Optional precomputed local smoothness object for non-stationary
 #'   adjustment: either a list returned by \code{smoothest(..., nonstationary = TRUE)},
-#'   or a 2D/3D image / file path containing local \code{dLh}, \code{RPV} (e.g. SPM's
-#'   \code{RPV.nii}), or positive voxel roughness weights. Supplying \code{local_smoothness}
-#'   automatically enables \code{nonstationary = TRUE} unless explicitly set to \code{FALSE}.
+#'   or a 2D/3D image / file path containing local \code{RPV} (e.g. SPM's
+#'   \code{RPV.nii}), \code{dLh}, or positive voxel roughness weights. Supplying
+#'   \code{local_smoothness} automatically enables \code{nonstationary = TRUE} unless
+#'   explicitly set to \code{FALSE}, and when \code{RPV} or \code{dLh} units are supplied
+#'   without \code{Rd}/\code{V}, global Riemannian \code{Rd} and \code{resels} are derived
+#'   directly from \code{local_smoothness}.
+#' @param local_smoothness_units Units of a 2D/3D image or file supplied via
+#'   \code{local_smoothness}: \code{"auto"} (default; detects \code{smoothest()} attributes,
+#'   filenames, or mean-1 weights and defaults other positive maps to SPM \code{"rpv"}),
+#'   \code{"rpv"} (RESELs per voxel, e.g. SPM \code{RPV.nii}), \code{"dlh"}
+#'   (\eqn{|\Lambda|^{1/2}}), or \code{"weights"} (dimensionless relative roughness weights).
 #' @param smooth_fwhm Numeric scalar; spatial Gaussian smoothing FWHM in voxels applied
 #'   within the mask to regularize voxelwise derivative statistics when estimating
 #'   non-stationary smoothness (default: \code{3.0}; Salimi-Khorshidi et al., 2011).
@@ -176,11 +184,13 @@ ptfce <- function(img,
                   legacy = FALSE,
                   nonstationary = FALSE,
                   local_smoothness = NULL,
+                  local_smoothness_units = c("auto", "rpv", "dlh", "weights"),
                   smooth_fwhm = 3.0,
                   fwe_method = c("grf", "grf_sim", "sign_flip"),
                   n_perm = 500L,
                   copes = NULL) {
   sided <- match.arg(sided)
+  local_smoothness_units <- match.arg(local_smoothness_units)
   if (!is_missing_arg(copes) && missing(fwe_method)) {
     fwe_method <- "sign_flip"
   } else {
@@ -292,7 +302,42 @@ ptfce <- function(img,
     }
   }
 
-  # If a precomputed smoothest(..., nonstationary = TRUE) list was supplied, reuse its parameters if needed
+  # Pre-parse external 2D/3D `local_smoothness` image/file (if supplied) so global V, Rd,
+  # and resels can be derived directly from RPV/dLh maps without falling back to 3D Z-map smoothest()
+  ext_loc_meta <- NULL
+  loc_units_eff <- local_smoothness_units
+  if (!is_missing_arg(local_smoothness) && !is.list(local_smoothness)) {
+    ext_loc_meta <- read_volume_input(local_smoothness, arg_name = "local_smoothness", allow_4d = FALSE)
+    if (!identical(ext_loc_meta$dim3, d3)) {
+      stop(sprintf("`local_smoothness` dimensions (%s) do not match `img` dimensions (%s).",
+                   paste(ext_loc_meta$dim3, collapse = "x"), paste(d3, collapse = "x")), call. = FALSE)
+    }
+    if (loc_units_eff == "auto") {
+      tag_u <- attr(local_smoothness, "ptfce_smoothness_units", exact = TRUE)
+      if (is.character(tag_u) && length(tag_u) == 1L && tag_u %in% c("rpv", "dlh", "weights")) {
+        loc_units_eff <- tag_u
+      } else if (is.character(local_smoothness)) {
+        bn <- basename(local_smoothness[1L])
+        if (grepl("dlh", bn, ignore.case = TRUE)) {
+          loc_units_eff <- "dlh"
+        } else if (grepl("weight", bn, ignore.case = TRUE)) {
+          loc_units_eff <- "weights"
+        } else {
+          loc_units_eff <- "rpv"
+        }
+      } else {
+        w_tmp <- as.numeric(ext_loc_meta$data)
+        pos_tmp <- inside & is.finite(w_tmp) & (w_tmp > 0)
+        if (any(pos_tmp) && abs(mean(w_tmp[pos_tmp]) - 1.0) <= 0.05) {
+          loc_units_eff <- "weights"
+        } else {
+          loc_units_eff <- "rpv"
+        }
+      }
+    }
+  }
+
+  # If a precomputed smoothest(..., nonstationary = TRUE) list or RPV/dLh map was supplied, reuse its parameters
   if (is.list(local_smoothness) && all(c("volume", "dLh", "resels") %in% names(local_smoothness))) {
     if (is_missing_arg(Rd) || is_missing_arg(V)) {
       autosmooth <- TRUE
@@ -304,6 +349,30 @@ ptfce <- function(img,
         Rd <- as.numeric(local_smoothness$dLh)[1L] * V
         resels <- as.numeric(local_smoothness$resels)[1L]
       }
+    }
+  } else if (!is.null(ext_loc_meta) && (is_missing_arg(Rd) || is_missing_arg(V)) &&
+             is_missing_arg(residual) && is.null(copes_meta) &&
+             loc_units_eff %in% c("rpv", "dlh")) {
+    w_vec_loc <- as.numeric(ext_loc_meta$data)
+    pos_loc <- inside & is.finite(w_vec_loc) & (w_vec_loc > 0)
+    if (!any(pos_loc)) {
+      stop("`local_smoothness` contains no positive finite values inside `mask`.", call. = FALSE)
+    }
+    usez_loc <- d3[3L] > 1L
+    rpv_scale_loc <- (4.0 * log(2.0))^(if (usez_loc) 1.5 else 1.0)
+    V <- as.numeric(sum(inside))
+    if (loc_units_eff == "rpv") {
+      mean_rpv <- mean(w_vec_loc[pos_loc])
+      dlh_ns_loc <- mean_rpv * rpv_scale_loc
+      resels <- 1.0 / mean_rpv
+    } else {
+      dlh_ns_loc <- mean(w_vec_loc[pos_loc])
+      resels <- rpv_scale_loc / dlh_ns_loc
+    }
+    Rd <- V * dlh_ns_loc
+    autosmooth <- TRUE
+    if (verbose) {
+      cat(sprintf("* Derived Riemannian global smoothness from `local_smoothness` (%s)...\n", loc_units_eff))
     }
   }
 
@@ -371,12 +440,12 @@ ptfce <- function(img,
           stop("`local_smoothness` list must contain `voxel_weights`, `dLh_map`, or `rpv_map`.", call. = FALSE)
         }
         w_meta <- read_volume_input(w_src, arg_name = "local_smoothness", allow_4d = FALSE)
+        if (!identical(w_meta$dim3, d3)) {
+          stop(sprintf("`local_smoothness` dimensions (%s) do not match `img` dimensions (%s).",
+                       paste(w_meta$dim3, collapse = "x"), paste(d3, collapse = "x")), call. = FALSE)
+        }
       } else {
-        w_meta <- read_volume_input(local_smoothness, arg_name = "local_smoothness", allow_4d = FALSE)
-      }
-      if (!identical(w_meta$dim3, d3)) {
-        stop(sprintf("`local_smoothness` dimensions (%s) do not match `img` dimensions (%s).",
-                     paste(w_meta$dim3, collapse = "x"), paste(d3, collapse = "x")), call. = FALSE)
+        w_meta <- ext_loc_meta
       }
       voxel_weights <- normalize_local_weights(as.numeric(w_meta$data))
     } else if (!is.null(smooth_computed) && !is.null(smooth_computed$voxel_weights)) {
@@ -611,9 +680,10 @@ ptfce <- function(img,
   if (fwe_method == "grf") {
     if (!is.na(number_of_resels)) {
       alpha_scale <- if (sided == "two.sided") 0.5 else 1.0
-      fwer0.05.Z <- fwe.p2z(number_of_resels, 0.05 * alpha_scale)
+      dim_fwe <- if (d3[3L] > 1L) 3L else 2L
+      fwer0.05.Z <- fwe.p2z(number_of_resels, 0.05 * alpha_scale, D = dim_fwe)
       fwe_Z <- stats::setNames(
-        fwe.p2z(number_of_resels, fwe_p * alpha_scale),
+        fwe.p2z(number_of_resels, fwe_p * alpha_scale, D = dim_fwe),
         format(fwe_p, trim = TRUE)
       )
     } else {
@@ -677,6 +747,7 @@ ptfce <- function(img,
                     src_lbl, n_perm))
       }
 
+      dof_sf_hint <- if (!is_missing_arg(dof)) as.numeric(dof)[1L] else NA_real_
       sf_res <- calibrate_fwer_signflip_cpp(
         data4d = sf_meta$data,
         mask = inside,
@@ -696,7 +767,8 @@ ptfce <- function(img,
         logpmax_fixed = lpmax_pass,
         dh = dh_pass,
         n_perm = n_perm,
-        voxel_weights = voxel_weights
+        voxel_weights = voxel_weights,
+        dof_hint = dof_sf_hint
       )
 
       if (!use_copes_sf && is.finite(sf_res$mean_temp_ar1) && abs(sf_res$mean_temp_ar1) > 0.25) {
@@ -835,11 +907,12 @@ aggregate_logpvals <- function(logpvals, d) {
 #' @param h Z-score cluster-forming threshold(s).
 #' @param V Number of voxels in mask.
 #' @param Rd Roughness-volume product (\code{dLh * V}).
+#' @param D Spatial dimension (\code{3} for 3D volumes, default; \code{2} for 2D planar images).
 #'
 #' @return Expected value of cluster size in voxels.
 #' @export
-Es <- function(h, V, Rd) {
-  es_cpp(as.numeric(h), as.numeric(V)[1L], as.numeric(Rd)[1L])
+Es <- function(h, V, Rd, D = 3L) {
+  es_cpp(as.numeric(h), as.numeric(V)[1L], as.numeric(Rd)[1L], as.integer(D)[1L])
 }
 
 dvox <- function(h) {
@@ -850,32 +923,37 @@ pvox <- function(h) {
   stats::pnorm(h, lower.tail = FALSE)
 }
 
-dclust <- function(h, V, Rd, c, ZestThr = 1.3, CONST = 1) {
+dclust <- function(h, V, Rd, c, ZestThr = 1.3, CONST = 1, D = 3L) {
   if (length(c) == 1L && is.na(c)) {
     return(dvox(h))
   }
+  dim_eff <- if (as.integer(D)[1L] == 2L) 2L else 3L
+  beta_d <- if (dim_eff == 2L) 1.0 else (2.0 / 3.0)
+  gam_d <- if (dim_eff == 2L) 1.0 else gamma(2.5)
   h_num <- as.numeric(h)
-  lam <- (Es(h_num, V, Rd) / gamma(2.5))^(-2 / 3)
-  log_d <- log(lam) - lam * (c^(2 / 3)) + log(CONST)
+  lam <- (Es(h_num, V, Rd, D = dim_eff) / gam_d)^(-beta_d)
+  log_d <- log(lam) - lam * (c^beta_d) + log(CONST)
   out <- exp(log_d)
   out[h_num < ZestThr] <- 0
   out
 }
 
-dvox.clust <- function(h, V, Rd, c, ZestThr = 1.3) {
+dvox.clust <- function(h, V, Rd, c, ZestThr = 1.3, D = 3L) {
   if (length(c) == 1L && is.na(c)) {
     return(dvox(h))
   }
-  dvox_clust_cpp(as.numeric(h), as.numeric(V)[1L], as.numeric(Rd)[1L], as.numeric(c)[1L], ZestThr)
+  dvox_clust_cpp(as.numeric(h), as.numeric(V)[1L], as.numeric(Rd)[1L],
+                 as.numeric(c)[1L], ZestThr, as.integer(D)[1L])
 }
 
-pvox.clust <- function(V, Rd, c, actH, ZestThr = 1.3) {
+pvox.clust <- function(V, Rd, c, actH, ZestThr = 1.3, D = 3L) {
   nlp <- neglog_pvox_clust_cpp(
     as.numeric(V)[1L],
     as.numeric(Rd)[1L],
     as.numeric(c),
     as.numeric(actH),
-    as.numeric(ZestThr)[1L]
+    as.numeric(ZestThr)[1L],
+    as.integer(D)[1L]
   )
   p <- exp(-nlp)
   p[p == 0] <- .Machine$double.xmin
@@ -1013,9 +1091,15 @@ smoothest <- function(img, mask, dof = NA, verbose = TRUE,
     dlh_ns <- sum(cpp_res$dLh_map) / cpp_res$volume
     out$dLh_nonstationary <- unname(dlh_ns)
     out$resels_nonstationary <- unname(rpv_scale / dlh_ns)
-    out$dLh_map <- wrap_volume_output(cpp_res$dLh_map, mask_meta)
-    out$rpv_map <- wrap_volume_output(cpp_res$dLh_map / rpv_scale, mask_meta)
-    out$voxel_weights <- wrap_volume_output(cpp_res$voxel_weights, mask_meta)
+    dlh_img <- wrap_volume_output(cpp_res$dLh_map, mask_meta)
+    rpv_img <- wrap_volume_output(cpp_res$dLh_map / rpv_scale, mask_meta)
+    vw_img  <- wrap_volume_output(cpp_res$voxel_weights, mask_meta)
+    attr(dlh_img, "ptfce_smoothness_units") <- "dlh"
+    attr(rpv_img, "ptfce_smoothness_units") <- "rpv"
+    attr(vw_img,  "ptfce_smoothness_units") <- "weights"
+    out$dLh_map <- dlh_img
+    out$rpv_map <- rpv_img
+    out$voxel_weights <- vw_img
   }
 
   out
@@ -1030,8 +1114,9 @@ interpolate <- function(v) {
             1.0281339, 1.0219834, 1.0180339, 1.0152850, 1.0132621, 1.0117115,
             1.0104851, 1.0068808, 1.0051200, 1.0033865, 1.0020191)
 
-  if (v < 5) return(1.1)
-  if (v > 500) {
+  if (v < 5) {
+    retval <- vals[1L]
+  } else if (v > 500) {
     retval <- 1.0321 / v + 1.0
   } else {
     retval <- stats::approx(x = knots, y = vals, xout = v)$y
@@ -1041,21 +1126,34 @@ interpolate <- function(v) {
 
 #' Convert Z-score value(s) to GRF FWER-corrected p-value(s)
 #'
-#' Uses the 3D Gaussian Random Field Expected Euler Characteristic approximation.
+#' Uses the 2D or 3D Gaussian Random Field Expected Euler Characteristic approximation.
 #' Vectorized over \code{Z} and \code{resel_count}.
 #'
 #' @param resel_count Number of resels in the search volume (\code{volume / resels}).
 #' @param Z Numeric vector of Z-score values.
+#' @param D Spatial dimension (\code{3} for 3D volumes, default; \code{2} for 2D planar images).
 #'
 #' @return Numeric vector of FWER-corrected p-values in \code{[0, 1]}.
 #' @export
-fwe.z2p <- function(resel_count, Z) {
-  ec_const <- 0.11694 # (4 * ln(2))^1.5 / (2 * pi)^2 (FSL convention)
+fwe.z2p <- function(resel_count, Z, D = 3L) {
+  dim_eff <- if (as.integer(D)[1L] == 2L) 2L else 3L
   df <- data.frame(r = as.numeric(resel_count), z = as.numeric(Z))
   out <- rep(1.0, nrow(df))
   na_idx <- is.na(df$r) | is.na(df$z)
   out[na_idx] <- NA_real_
 
+  if (dim_eff == 2L) {
+    ec_const_2d <- (4.0 * log(2.0)) / ((2.0 * pi)^1.5)
+    ok <- !na_idx & (df$z >= 1.0)
+    if (any(ok)) {
+      z_ok <- df$z[ok]
+      log_p <- log(df$r[ok]) + log(ec_const_2d) - 0.5 * z_ok * z_ok + log(z_ok)
+      out[ok] <- pmin(1.0, exp(log_p))
+    }
+    return(out)
+  }
+
+  ec_const <- 0.11694 # (4 * ln(2))^1.5 / (2 * pi)^2 (FSL convention)
   ok <- !na_idx & (df$z >= 2.0)
   if (any(ok)) {
     z_ok <- df$z[ok]
@@ -1067,17 +1165,19 @@ fwe.z2p <- function(resel_count, Z) {
 
 #' Compute GRF FWER-corrected Z-score threshold(s) from p-value(s)
 #'
-#' Uses Newton-Raphson in log-space to invert the 3D Expected Euler Characteristic
+#' Uses Newton-Raphson in log-space to invert the 2D or 3D Expected Euler Characteristic
 #' FWER approximation accurately across arbitrary \code{FWEP} and \code{resel_count}.
 #' Vectorized over \code{FWEP} and \code{resel_count}.
 #'
 #' @param resel_count Number of resels in the search volume (\code{volume / resels}).
 #' @param FWEP Numeric vector of target FWER-corrected p-values (default: \code{0.05}).
+#' @param D Spatial dimension (\code{3} for 3D volumes, default; \code{2} for 2D planar images).
 #'
 #' @return Numeric vector of Z-score thresholds.
 #' @export
-fwe.p2z <- function(resel_count, FWEP = 0.05) {
-  ec_const <- 0.11694 # (4 * ln(2))^1.5 / (2 * pi)^2 (FSL convention)
+fwe.p2z <- function(resel_count, FWEP = 0.05, D = 3L) {
+  dim_eff <- if (as.integer(D)[1L] == 2L) 2L else 3L
+  ec_const <- if (dim_eff == 2L) (4.0 * log(2.0)) / ((2.0 * pi)^1.5) else 0.11694
   df <- data.frame(r = as.numeric(resel_count), fwep = as.numeric(FWEP))
   out <- numeric(nrow(df))
 
@@ -1089,33 +1189,55 @@ fwe.p2z <- function(resel_count, FWEP = 0.05) {
       next
     }
     log_target <- log(fwep) - log(r) - log(ec_const)
-    # At z = 2, log(z^2 - 1) - 0.5*z^2 = log(3) - 2 = -0.9013877; FSL returns 0 for p > 0.5
     if (log_target > log(0.5)) {
       out[i] <- 0.0
       next
     }
-    if (log_target >= log(3.0) - 2.0) {
-      out[i] <- 2.0
-      next
-    }
 
-    # Solve g(z) = log(z^2 - 1) - 0.5 * z^2 - log_target = 0 for z > 2
-    # g'(z) = 2*z / (z^2 - 1) - z = -z * (z^2 - 3) / (z^2 - 1)
-    # Note g(z) has maximum at z = sqrt(3) < 2 and is strictly decreasing & concave for z > 2!
-    z <- max(2.1, sqrt(-2.0 * log_target + 2.0 * log(max(2.0, -2.0 * log_target))))
-    for (it in 1:30) {
-      z2 <- z * z
-      g <- log(z2 - 1.0) - 0.5 * z2 - log_target
-      gp <- (2.0 * z) / (z2 - 1.0) - z
-      step <- g / gp
-      z_new <- max(2.0000001, z - step)
-      if (abs(z_new - z) <= 1e-13 * z_new) {
-        z <- z_new
-        break
+    if (dim_eff == 2L) {
+      # 2D: g(z) = log(z) - 0.5 * z^2 - log_target; maximum at z = 1 is -0.5
+      if (log_target >= -0.5) {
+        out[i] <- 1.0
+        next
       }
-      z <- z_new
+      z <- max(1.1, sqrt(-2.0 * log_target + log(max(1.0, -2.0 * log_target))))
+      for (it in 1:30) {
+        g <- log(z) - 0.5 * z * z - log_target
+        gp <- (1.0 / z) - z
+        step <- g / gp
+        z_new <- max(1.0000001, z - step)
+        if (abs(z_new - z) <= 1e-13 * z_new) {
+          z <- z_new
+          break
+        }
+        z <- z_new
+      }
+      out[i] <- z
+    } else {
+      # At z = 2, log(z^2 - 1) - 0.5*z^2 = log(3) - 2 = -0.9013877; FSL returns 0 for p > 0.5
+      if (log_target >= log(3.0) - 2.0) {
+        out[i] <- 2.0
+        next
+      }
+
+      # Solve g(z) = log(z^2 - 1) - 0.5 * z^2 - log_target = 0 for z > 2
+      # g'(z) = 2*z / (z^2 - 1) - z = -z * (z^2 - 3) / (z^2 - 1)
+      # Note g(z) has maximum at z = sqrt(3) < 2 and is strictly decreasing & concave for z > 2!
+      z <- max(2.1, sqrt(-2.0 * log_target + 2.0 * log(max(2.0, -2.0 * log_target))))
+      for (it in 1:30) {
+        z2 <- z * z
+        g <- log(z2 - 1.0) - 0.5 * z2 - log_target
+        gp <- (2.0 * z) / (z2 - 1.0) - z
+        step <- g / gp
+        z_new <- max(2.0000001, z - step)
+        if (abs(z_new - z) <= 1e-13 * z_new) {
+          z <- z_new
+          break
+        }
+        z <- z_new
+      }
+      out[i] <- z
     }
-    out[i] <- z
   }
   out
 }

@@ -24,6 +24,7 @@ ptfce(
   legacy = FALSE,
   nonstationary = FALSE,
   local_smoothness = NULL,
+  local_smoothness_units = c("auto", "rpv", "dlh", "weights"),
   smooth_fwhm = 3,
   fwe_method = c("grf", "grf_sim", "sign_flip"),
   n_perm = 500L,
@@ -90,9 +91,18 @@ Salimi-Khorshidi et al., 2011). Default is \code{FALSE} (stationary cluster voxe
 
 \item{local_smoothness}{Optional precomputed local smoothness object for non-stationary
 adjustment: either a list returned by \code{smoothest(..., nonstationary = TRUE)},
-or a 2D/3D image / file path containing local \code{dLh}, \code{RPV} (e.g. SPM's
-\code{RPV.nii}), or positive voxel roughness weights. Supplying \code{local_smoothness}
-automatically enables \code{nonstationary = TRUE} unless explicitly set to \code{FALSE}.}
+or a 2D/3D image / file path containing local \code{RPV} (e.g. SPM's
+\code{RPV.nii}), \code{dLh}, or positive voxel roughness weights. Supplying
+\code{local_smoothness} automatically enables \code{nonstationary = TRUE} unless
+explicitly set to \code{FALSE}, and when \code{RPV} or \code{dLh} units are supplied
+without \code{Rd}/\code{V}, global Riemannian \code{Rd} and \code{resels} are derived
+directly from \code{local_smoothness}.}
+
+\item{local_smoothness_units}{Units of a 2D/3D image or file supplied via
+\code{local_smoothness}: \code{"auto"} (default; detects \code{smoothest()} attributes,
+filenames, or mean-1 weights and defaults other positive maps to SPM \code{"rpv"}),
+\code{"rpv"} (RESELs per voxel, e.g. SPM \code{RPV.nii}), \code{"dlh"}
+(\eqn{|\Lambda|^{1/2}}), or \code{"weights"} (dimensionless relative roughness weights).}
 
 \item{smooth_fwhm}{Numeric scalar; spatial Gaussian smoothing FWHM in voxels applied
 within the mask to regularize voxelwise derivative statistics when estimating

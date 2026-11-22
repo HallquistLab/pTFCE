@@ -4,18 +4,20 @@
 \alias{fwe.p2z}
 \title{Compute GRF FWER-corrected Z-score threshold(s) from p-value(s)}
 \usage{
-fwe.p2z(resel_count, FWEP = 0.05)
+fwe.p2z(resel_count, FWEP = 0.05, D = 3L)
 }
 \arguments{
 \item{resel_count}{Number of resels in the search volume (\code{volume / resels}).}
 
 \item{FWEP}{Numeric vector of target FWER-corrected p-values (default: \code{0.05}).}
+
+\item{D}{Spatial dimension (\code{3} for 3D volumes, default; \code{2} for 2D planar images).}
 }
 \value{
 Numeric vector of Z-score thresholds.
 }
 \description{
-Uses Newton-Raphson in log-space to invert the 3D Expected Euler Characteristic
+Uses Newton-Raphson in log-space to invert the 2D or 3D Expected Euler Characteristic
 FWER approximation accurately across arbitrary \code{FWEP} and \code{resel_count}.
 Vectorized over \code{FWEP} and \code{resel_count}.
 }
